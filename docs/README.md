@@ -38,4 +38,4 @@ Serialized frames is the main path, and the [alpha](alpha.md) is built on it: cr
 - [Related work](related-work.md): Infinity (Hydro), and how it compares.
 - [Status](status.md): what each PoC step showed, how to run it, and what is left for an alpha.
 
-Tested on `rustc 1.102.0-nightly (2026-11-07)`, macOS arm64 (PIE).
+Tested on `rustc 1.102.0-nightly (2026-11-07)`: macOS arm64 and Linux x86_64 (Ubuntu 24.04).
