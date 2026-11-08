@@ -32,6 +32,4 @@ echo "== serialized frames: profile holds Vec<String> + String across slow calls
 "$BIN" sstart profile 7; echo 40 > results/7; "$BIN" sresume; cat snap.json; echo
 echo 2 > results/1007; "$BIN" sresume   # expect 60
 
-rm -f snap.json results/*
-echo "== serialized frames: leaky is refused (reference at the slow point)"
-"$BIN" sstart leaky 7; echo "exit=$?"
+# A workflow like `leaky` is now rejected at compile time: see driver/lint-check.sh.

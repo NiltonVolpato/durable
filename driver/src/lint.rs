@@ -1,66 +1,107 @@
-//! Compile-time check: at every slow await, every live value must be
-//! serializable by the glue. A state is slow if its awaited future can reach
-//! a type implementing `durable_poc::SlowLeaf` (directly, as a generic
-//! argument, or through nested coroutines). Workflows marked
-//! `#[durable::raw]` use the raw-copy path and are skipped.
+//! Compile-time check: at every slow await reachable from a workflow root,
+//! every live value must be serializable by the glue.
+//!
+//! A frame can park if it awaits a type implementing `durable_poc::SlowLeaf`,
+//! or another frame that can park (a coroutine, or a `Structural` combinator
+//! with such a field). Computed as a fixpoint over the collected frames.
+//! A wrapper the driver cannot see into counts as slow if one of its generic
+//! arguments is a frame that can park (e.g. `Ephemeral<{async block}>`).
+//! Type-erased futures (`Pin<Box<dyn Future>>`) count as fast: a slow leaf
+//! hidden there is only caught at run time, when serialization fails.
 
-use crate::glue::{self, Planner};
-use crate::{Coroutine, State};
-use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
-use rustc_span::Symbol;
+use crate::glue::{self, Kind, Planner};
+use crate::{Ctx, Field, Frame, Shape, State};
+use rustc_middle::ty::{self, Ty, TypeVisitableExt};
 use rustc_span::def_id::DefId;
-use std::collections::HashSet;
 
-fn is_raw(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    let root = tcx.typeck_root_def_id(def_id);
-    let path = [Symbol::intern("durable"), Symbol::intern("raw")];
-    tcx.tool_attrs(root, &path).next().is_some()
+fn awaitee<'a, 'tcx>(st: &'a State<'tcx>) -> Option<&'a Field<'tcx>> {
+    st.fields.iter().find(|f| f.name == "__awaitee")
 }
 
-fn awaits_slow<'tcx>(tcx: TyCtxt<'tcx>, leaf: DefId, slow: &HashSet<DefId>, st: &State<'tcx>) -> bool {
-    st.fields.iter().filter(|f| f.name == "__awaitee").any(|f| {
-        f.ty.walk().filter_map(|a| a.as_type()).any(|t| match t.kind() {
-            ty::Coroutine(d, _) => slow.contains(d),
-            ty::Adt(..) if !t.has_erased_regions() => glue::implements(tcx, leaf, t, &[]),
-            _ => false,
-        })
-    })
+struct Slow<'a, 'tcx> {
+    cx: &'a Ctx<'tcx>,
+    planner: &'a Planner<'a, 'tcx>,
+    leaf: DefId,
+    slow: Vec<bool>,
 }
 
-/// Coroutines that can park on a slow leaf (fixpoint over nesting).
-fn slow_coroutines<'tcx>(tcx: TyCtxt<'tcx>, leaf: DefId, cos: &[Coroutine<'tcx>]) -> HashSet<DefId> {
-    let mut slow = HashSet::new();
-    loop {
-        let before = slow.len();
-        for co in cos {
-            if !slow.contains(&co.def_id) && co.states.iter().any(|st| awaits_slow(tcx, leaf, &slow, st)) {
-                slow.insert(co.def_id);
+impl<'tcx> Slow<'_, 'tcx> {
+    fn can_park(&self, ty: Ty<'tcx>) -> bool {
+        match self.planner.id(ty) {
+            Some(i) => self.slow[i],
+            // A wrapper the driver cannot see into (e.g. `Ephemeral<F>`): it can
+            // park if it is a slow leaf, or wraps a frame that can park.
+            None => {
+                matches!(ty.kind(), ty::Adt(..))
+                    && ((!ty.has_erased_regions() && !ty.has_escaping_bound_vars() && glue::implements(self.cx.tcx, self.leaf, ty, &[]))
+                        || ty.walk().skip(1).filter_map(|a| a.as_type()).any(|t| self.planner.id(t).is_some_and(|i| self.slow[i])))
             }
         }
-        if slow.len() == before {
-            return slow;
+    }
+
+    fn parks_at(&self, st: &State<'tcx>) -> bool {
+        st.index >= 3 && awaitee(st).is_some_and(|f| self.can_park(f.ty))
+    }
+
+    fn frame_parks(&self, fr: &Frame<'tcx>) -> bool {
+        match &fr.shape {
+            Shape::Coroutine { states, .. } => states.iter().any(|st| self.parks_at(st)),
+            Shape::Fields(fields) => fields.iter().any(|f| self.can_park(f.ty)),
         }
     }
 }
 
 /// Emit an error for each slow await that holds something unserializable.
 /// Returns the number of errors.
-pub fn check<'tcx>(tcx: TyCtxt<'tcx>, cos: &[Coroutine<'tcx>], planner: &Planner<'tcx>) -> usize {
-    let Some(leaf) = glue::find_trait(tcx, &["durable_poc"], "SlowLeaf") else { return 0 };
-    let slow = slow_coroutines(tcx, leaf, cos);
+pub fn check<'tcx>(cx: &Ctx<'tcx>, frames: &[Frame<'tcx>], planner: &Planner<'_, 'tcx>) -> usize {
+    let Some(leaf) = glue::find_trait(cx.tcx, &["durable_poc"], "SlowLeaf") else { return 0 };
+    let mut s = Slow { cx, planner, leaf, slow: vec![false; frames.len()] };
+    loop {
+        let mut changed = false;
+        for (i, fr) in frames.iter().enumerate() {
+            if !s.slow[i] && s.frame_parks(fr) {
+                s.slow[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     let mut errors = 0;
-    for co in cos.iter().filter(|co| !is_raw(tcx, co.def_id)) {
-        for st in co.states.iter().filter(|st| st.index >= 3 && awaits_slow(tcx, leaf, &slow, st)) {
-            if let Err((f, why)) = planner.plan(co, st) {
-                tcx.dcx()
-                    .struct_span_err(st.span, format!("`{}` cannot be serialized at this slow await", f.name))
-                    .with_span_label(st.span, "the task can park here")
-                    .with_span_note(f.span, format!("`{}` is live across the await: {why}", f.name))
-                    .with_help(
-                        "make it serializable, end it before the await, or mark the workflow `#[durable::raw]`",
-                    )
-                    .emit();
-                errors += 1;
+    let mut report = |st: &State<'tcx>, f: &Field<'tcx>, what: String, why: String| {
+        let mut d = cx
+            .tcx
+            .dcx()
+            .struct_span_err(st.span, format!("`{what}` cannot be serialized at this slow await"))
+            .with_span_label(st.span, "the task can park here")
+            .with_span_note(f.span, format!("`{}` is live across the await: {why}", f.name))
+            .with_help("make it serializable, or end it before the await");
+        if f.ty.needs_drop(cx.tcx, ty::TypingEnv::fully_monomorphized()) {
+            d = d.with_help(format!(
+                "values with a destructor stay live until the end of their scope; \
+                 if `{}` is not used after this point, `drop` it or close its block before the await",
+                f.name
+            ));
+        }
+        d.emit();
+        errors += 1;
+    };
+    for fr in frames {
+        let Shape::Coroutine { states, .. } = &fr.shape else { continue };
+        for st in states.iter().filter(|st| s.parks_at(st)) {
+            let Some(values) = planner.state_values(fr, st) else { continue };
+            match planner.plan(values) {
+                Err((f, why)) => report(st, f, f.name.clone(), why),
+                Ok(plan) => {
+                    for (f, k) in &plan {
+                        if let Kind::Nested(j) = k
+                            && let Err(e) = planner.deep_check(*j, 0)
+                        {
+                            report(st, f, format!("{}.{e}", f.name).split(':').next().unwrap().to_string(), e);
+                        }
+                    }
+                }
             }
         }
     }

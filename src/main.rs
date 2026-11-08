@@ -27,6 +27,7 @@ fn sum(s: &[u8]) -> u64 {
 }
 
 /// v0 workflow, plus a nested async fn with its own slow call.
+#[durable::workflow]
 async fn classify(req_id: u64, body: [u8; 64]) -> u64 {
     let quick = ephemeral(async {
         let s = &body[..]; // borrow, allowed inside ephemeral
@@ -52,7 +53,6 @@ struct Note {
     weight: u64,
 }
 
-#[durable::raw] // arena handles: raw-copy path only
 async fn triage(req_id: u64) -> u64 {
     let mut history: DVec<u64> = DVec::new();
     for i in 1..=32 {
@@ -77,6 +77,7 @@ async fn triage(req_id: u64) -> u64 {
 }
 
 /// Serialized-frame workflow: heap data held across slow awaits.
+#[durable::workflow]
 async fn profile(req_id: u64) -> u64 {
     let mut words: Vec<String> = vec![format!("req-{req_id}")];
     let label = String::from("abuse");
@@ -89,6 +90,7 @@ async fn profile(req_id: u64) -> u64 {
 
 /// Versioned workflow for loading old snapshots into new builds (EVOLVE=1|2|3).
 #[cfg(evolve = "1")]
+#[durable::workflow]
 async fn evolve(req_id: u64) -> u64 {
     let words = vec![format!("req-{req_id}")];
     let label = String::from("abuse");
@@ -98,6 +100,7 @@ async fn evolve(req_id: u64) -> u64 {
 
 /// v2: a new slow step after the first. Same live locals at the first await.
 #[cfg(evolve = "2")]
+#[durable::workflow]
 async fn evolve(req_id: u64) -> u64 {
     let words = vec![format!("req-{req_id}")];
     let label = String::from("abuse");
@@ -109,6 +112,7 @@ async fn evolve(req_id: u64) -> u64 {
 
 /// v3: a new local live at the first await. Old snapshots must be refused.
 #[cfg(evolve = "3")]
+#[durable::workflow]
 async fn evolve(req_id: u64) -> u64 {
     let words = vec![format!("req-{req_id}")];
     let label = String::from("abuse");
@@ -119,7 +123,6 @@ async fn evolve(req_id: u64) -> u64 {
 
 /// Negative control: borrow of the frame across a slow await, forced past
 /// the check with ForceDurable. Correct answer for id 7, result 40: 47.
-#[durable::raw]
 async fn leaky(req_id: u64, body: [u8; 64]) -> u64 {
     let s = &body[..];
     let a = slow(req_id).await;
@@ -128,7 +131,6 @@ async fn leaky(req_id: u64, body: [u8; 64]) -> u64 {
 
 /// Negative control for Option A: a slow leaf and an ephemeral section in a
 /// join. The leaf parks before the section starts, so the leaf's assert passes.
-#[durable::raw]
 async fn racy(req_id: u64, body: [u8; 64]) -> u64 {
     let (a, quick) = join2(
         slow(req_id),

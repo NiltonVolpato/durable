@@ -326,29 +326,36 @@ What it changes in the design:
 
 The driver also rejects, at compile time, any slow await whose live state cannot be serialized:
 
-- Slow leaves are marked with a trait: `pub trait SlowLeaf {}`, with `impl SlowLeaf for Slow`.
-- A state is slow if its `__awaitee` type, or any of its generic arguments, implements `SlowLeaf` or is a coroutine with a slow state (fixpoint over nesting).
-- At each slow state, every live value must pass the glue planner (serde impl, no references, no unnameable types, ...). Otherwise the driver emits an error and stops before generating glue.
-- Workflows on the raw-copy path opt out with `#[durable::raw]` (`#![feature(register_tool)] #![register_tool(durable)]`).
+- **Roots:** `async fn`s marked `#[durable::workflow]` (`#![feature(register_tool)] #![register_tool(durable)]`). Only frames reachable from a root are checked and get glue. Runtime code (a `host` that polls tasks) and raw-copy workflows are simply not marked.
+- **Slow leaves** are marked with a trait: `pub trait SlowLeaf {}`, implemented by `Slow` and `SleepUntil`.
+- **Slow frames** (fixpoint over the reachable frames). A frame can park if it awaits one of:
+  - a slow leaf;
+  - a frame that can park (a coroutine, or a `Structural` combinator with such a field);
+  - an opaque wrapper with such a frame among its generic arguments (`Ephemeral<{async block}>`).
+- **Not seen:** type-erased futures (`Pin<Box<dyn Future>>`) count as fast. A slow call hidden there is only caught at run time, when serialization fails.
+- **The check:** at each slow state, every live value must pass the glue planner (serde impl, no references, no unnameable types, ...), and so must every closure or combinator it holds, recursively. Otherwise the driver emits an error and stops before generating glue.
 
 ```
-error: `iter` cannot be serialized at this slow await
-  --> examples/lint_fail.rs:17:24
-17 |         t += slow(*id).await;
-   |                        ^^^^^ the task can park here
-note: `iter` is live across the await: `std::slice::Iter<'_, u64>` has lifetimes
-16 |     for id in ids.iter() {
-   = help: make it serializable, end it before the await, or mark the workflow `#[durable::raw]`
+error: `f` cannot be serialized at this slow await
+  --> examples/lint_fail.rs:52:14
+52 |     slow(id).await + n
+   |              ^^^^^ the task can park here
+note: `f` is live across the await: `std::fs::File` does not implement Serialize + DeserializeOwned
+50 |     let f = std::fs::File::open("/dev/null").unwrap();
+   = help: make it serializable, or end it before the await
+   = help: values with a destructor stay live until the end of their scope; if `f` is not
+           used after this point, `drop` it or close its block before the await
 ```
 
-`driver/lint-check.sh` builds `examples/lint_fail.rs` and gets 5 errors:
+`driver/lint-check.sh` builds `examples/lint_fail.rs` and gets 6 errors:
 
 - a borrow;
 - a hidden `for` iterator;
 - a type without serde impls;
-- a slow call inside `ephemeral`, reported both at the outer await and at the borrow inside the section.
+- a slow call inside `ephemeral`, at the outer await and at the borrow inside the section;
+- a `File` kept alive only for its destructor.
 
-Fast awaits are not checked, so borrows across them need no annotation. Unlike Option A, a slow call inside an ephemeral section is now a compile error.
+Fast awaits are not checked, so borrows across them need no annotation. Unlike Option A, a slow call inside an ephemeral section is a compile error.
 
 ### Loading snapshots into a changed build
 
@@ -378,13 +385,55 @@ What it covers:
 - No UB, no leaks. Resumed `async fn` code reads only the live fields and the tag.
 - Negative control: glue with one field removed (`label`) gives "reading memory ... but memory is uninitialized".
 
+### Realistic probe on tokio
+
+`probe/` is a tokio binary (current-thread runtime). `steps/` is a small SDK crate (`wait_for_review`, `check`, generic `retry`). `probe/run.sh <id>` drives the `moderate` workflow through every slow point, one process per step:
+
+```rust
+#[durable::workflow]
+async fn moderate(req_id: u64, addr: String) -> u64 {
+    let quick = fast_score(&addr, req_id).await;          // real TcpStream I/O, borrows
+    if quick < 10 { return quick; }
+    let note = format!("req {req_id} scored {quick}");
+    if quick % 2 == 0 { audit(note); }                    // conditional move: drop flag
+    let a = wait_for_review(req_id).await;                // async fn from another crate
+    let (b, c) = join2(wait_for_review(req_id + 1), wait_for_review(req_id + 2)).await;
+    let d = match select2(wait_for_review(req_id + 3), sleep_until(now() + 2)).await {
+        Either::Left(v) => v,
+        Either::Right(()) => 0,                           // durable timer won
+    };
+    let e = retry(3, move |attempt| check(req_id + 4 + attempt as u64)).await;  // generic + closure
+    quick + a + b + c + d + e
+}
+```
+
+The host polls the `Task` with tokio's real waker. Pending without a slow park means fast work, and tokio wakes it. Pending with a park means serialize the task and stop.
+
+What broke, and how it was fixed in the driver:
+
+- **Cross-crate slow calls were invisible.** The lint only knew local coroutines, so awaits on `durable_steps` futures counted as fast and nothing was checked there (unsound). Fix: start from `#[durable::workflow]` roots and collect every reachable frame with concrete generic arguments, from any crate (`coroutine_layout` and optimized MIR of foreign coroutines are available). The glue serializes the foreign frame's private locals too (`requested_at`).
+- **False positive on the runtime.** Scanning generic arguments made `host<moderate>` look slow. Fixed by the same change: only frames reachable from roots are checked, and a coroutine's own generic arguments are not scanned.
+- **Generic coroutines** (`retry::<{closure}, {check}>`): handled by the same reachable-frame collection, with field types instantiated and normalized.
+- **Combinators** (`Join2`, `Select2` hold coroutine types, so no serde): `unsafe trait Structural` lets the driver serialize a struct field by field. Its nested frames recurse.
+- **Closures** (`retry`'s `f`): serialized as their captures (`{"c0": 7}`). The closure's code comes from its type.
+- **Unresumed and returned states:** a join holds a finished branch (`{"state": 1}`), and a frame may hold an unstarted future (state 0: its upvars). Both are now handled.
+- **Drop flags** (`note` conditionally moved). The driver reads the coroutine's optimized MIR: `switchInt(flag) -> [0: .., otherwise: bbX]` where `bbX` drops a saved local, which pairs the flag with the value. The glue writes `"note.init": bool` and `"note"` only when the flag is true. Both cases run (odd and even ids).
+- **Slow calls inside opaque wrappers** (`Ephemeral<{async block}>`): the frame inside is collected, and the wrapper counts as slow if that frame is.
+
+Results: `probe/run.sh 7` → 65 and `probe/run.sh 8` → 66, through 6 parks. These cover the join with one branch finished, the deadline expiring between processes, and retry attempt 2 resumed. The new glue paths (join, closure, generic helper, drop flag set and cleared) also pass under Miri (`combo` in `tests/serde_roundtrip.rs`).
+
+Ergonomics finding: values with a destructor stay live until the end of their scope. `addr` is used only in the fast part but appears in every snapshot. A `TcpStream` kept that way would be a lint error. The lint now suggests `drop(x)` or a block for such values.
+
 ### Still open
 
-- Generic coroutines, drop flags (currently refused), and closures or `async` blocks with upvars held by a parent frame.
-- Types are named by path from the glue module, so private types in other modules fail to compile in pass 2.
+- Type-erased futures (`Pin<Box<dyn Future>>`) at slow points: invisible to the lint. Serializing them would need a registry keyed by the concrete type.
+- Enums holding frames (`Option<{async fn}>`, `MaybeDone`-style combinators): `Structural` covers structs only.
+- Combinators must opt in to `Structural`. tokio's own (`tokio::join!`, `select!`, `timeout`) cannot be used at slow points.
+- The probe host is single-threaded. `Task` is `!Send`; a multi-threaded runtime would need `Send` for tasks whose root is `Send`.
+- Types are named by path from the glue module, so private types in other modules fail to compile in pass 2. (Foreign private types work when they are only stored through serde of public types or recursed as frames.)
 - A failed deserialize leaks the fields written before the failure.
-- Stable state keys (see above).
-- The driver pins the project to rustc internals, which change on every nightly. Several APIs had already changed on this one.
+- Stable state keys (see snapshot versioning).
+- The driver pins the project to rustc internals, which change on every nightly.
 
 ## Known holes and open questions
 
@@ -423,7 +472,7 @@ Open questions:
 
 ## PoC status
 
-Code: `src/lib.rs` (trait, leaves, `Ephemeral`, `run`), `src/arena.rs` (`Task`, `ABox`, `DVec`, `RelRef`), `src/glue.rs` (serialized-frame runtime), `src/main.rs` (`poc` binary), `src/compile_checks.rs` (doctests), `tests/roundtrip.rs`, `driver/` (rustc_driver), `build-glue.sh`, `demo.sh`.
+Code: `src/lib.rs` (trait, leaves, `Ephemeral`, `run`), `src/arena.rs` (`Task`, `ABox`, `DVec`, `RelRef`), `src/glue.rs` (serialized-frame runtime), `src/main.rs` (`poc` binary), `src/compile_checks.rs` (doctests), `tests/roundtrip.rs`, `tests/serde_roundtrip.rs`, `driver/` (rustc_driver), `steps/` (SDK crate), `probe/` (tokio workflow), `build-glue.sh`, `demo.sh`.
 
 ```
 cargo test                    # compile checks + in-process round trip
@@ -457,6 +506,10 @@ See [Serialized frames](#serialized-frames-rustc_driver-experiment).
 - `driver/lint-check.sh`: compile-time lint.
 - `driver/evolve-demo.sh`: old snapshot into a changed build.
 - `driver/serde-test.sh`: native + Miri round trips.
+
+### Realistic probe on tokio: done
+
+See [Realistic probe on tokio](#realistic-probe-on-tokio). `probe/run.sh 7`.
 
 ### v2: next
 

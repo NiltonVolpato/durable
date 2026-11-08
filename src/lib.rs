@@ -160,6 +160,61 @@ impl<A: Future, B: Future> Future for Join2<A, B> {
     }
 }
 
+/// Durable timer: ready once the wall clock reaches `deadline` (unix secs).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SleepUntil {
+    deadline: u64,
+}
+pub fn sleep_until(deadline: u64) -> SleepUntil {
+    SleepUntil { deadline }
+}
+impl SlowLeaf for SleepUntil {}
+impl Future for SleepUntil {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _: &mut Context) -> Poll<()> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        if now >= self.deadline {
+            return Poll::Ready(());
+        }
+        with_header(|h| h.parked = self.deadline);
+        Poll::Pending
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub enum Either<A, B> {
+    Left(A),
+    Right(B),
+}
+
+/// First of two futures to finish (polls `a` first); the other is dropped.
+pub struct Select2<A, B> {
+    a: A,
+    b: B,
+}
+pub fn select2<A: Future, B: Future>(a: A, b: B) -> Select2<A, B> {
+    Select2 { a, b }
+}
+impl<A: Future, B: Future> Future for Select2<A, B> {
+    type Output = Either<A::Output, B::Output>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        if let Poll::Ready(v) = unsafe { Pin::new_unchecked(&mut this.a) }.poll(cx) {
+            return Poll::Ready(Either::Left(v));
+        }
+        if let Poll::Ready(v) = unsafe { Pin::new_unchecked(&mut this.b) }.poll(cx) {
+            return Poll::Ready(Either::Right(v));
+        }
+        Poll::Pending
+    }
+}
+
+/// Safety: durable-driver may serialize and rebuild this type field by field,
+/// bypassing its constructors. Its fields must carry all of its state.
+pub unsafe trait Structural {}
+unsafe impl<A: Future, B: Future> Structural for Join2<A, B> {}
+unsafe impl<A, B> Structural for Select2<A, B> {}
+
 /// Escape hatch used only by the negative-control demos.
 pub struct ForceDurable<F>(pub F);
 unsafe impl<F> Durable for ForceDurable<F> {}
