@@ -2,15 +2,17 @@
 //!
 //! For each coroutine `i`: `__ser_i(frame) -> Value` and `__de_i(&Value, frame)`.
 //! Each suspension state becomes a JSON object
-//! `{ "state": N, "at": "file:line:col", <local>: <value>, ... }`.
+//! `{ "state": N, "sig": "...", "at": "file:line:col", <local>: <value>, ... }`.
 //! Nested coroutine frames (the `__awaitee` of an `async fn` call) recurse.
+//! `sig` lists the state's live locals and types; deserialize requires an
+//! exact match, so a snapshot only loads into a build with the same state.
 
-use crate::Coroutine;
+use crate::{Coroutine, Field, State};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::ty::print::{with_crate_prefix, with_no_trimmed_paths};
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_span::def_id::DefId;
+use rustc_trait_selection::infer::InferCtxtExt;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -53,51 +55,50 @@ fn uint(bytes: u64) -> &'static str {
     }
 }
 
-/// serde's `Serialize` / `Deserialize` traits, if serde is in the crate graph.
-struct Serde {
-    ser: DefId,
-    de: DefId,
+/// Find a trait by crate and item name anywhere in the crate graph.
+pub fn find_trait(tcx: TyCtxt<'_>, crates: &[&str], name: &str) -> Option<DefId> {
+    tcx.all_traits_including_private()
+        .find(|did| crates.contains(&tcx.crate_name(did.krate).as_str()) && tcx.item_name(*did).as_str() == name)
 }
 
-fn find_serde(tcx: TyCtxt<'_>) -> Option<Serde> {
-    let (mut ser, mut de) = (None, None);
-    for did in tcx.all_traits_including_private() {
-        if !matches!(tcx.crate_name(did.krate).as_str(), "serde" | "serde_core") {
-            continue;
-        }
-        match tcx.item_name(did).as_str() {
-            "Serialize" => ser = Some(did),
-            "Deserialize" => de = Some(did),
-            _ => {}
-        }
-    }
-    Some(Serde { ser: ser?, de: de? })
-}
-
-/// Whether `ty: Serialize + for<'de> Deserialize<'de>` (checked at 'static).
-fn is_serde<'tcx>(tcx: TyCtxt<'tcx>, s: &Serde, ty: Ty<'tcx>) -> bool {
+/// Whether `ty: Trait<extra...>` holds (no generics in scope).
+pub fn implements<'tcx>(tcx: TyCtxt<'tcx>, tr: DefId, ty: Ty<'tcx>, extra: &[ty::GenericArg<'tcx>]) -> bool {
     let infcx = tcx.infer_ctxt().build(ty::TypingMode::non_body_analysis());
-    let env = ty::ParamEnv::empty();
-    infcx.type_implements_trait(s.ser, [ty::GenericArg::from(ty)], env).must_apply_modulo_regions()
-        && infcx
-            .type_implements_trait(s.de, [ty::GenericArg::from(ty), tcx.lifetimes.re_static.into()], env)
-            .must_apply_modulo_regions()
+    let args: Vec<ty::GenericArg<'tcx>> = std::iter::once(ty.into()).chain(extra.iter().copied()).collect();
+    infcx.type_implements_trait(tr, args, ty::ParamEnv::empty()).must_apply_modulo_regions()
 }
 
 /// How one field is handled.
-enum Kind {
+pub enum Kind {
     Nested(usize),
     Serde(String),
     /// `[T; N]`: serde only covers N <= 32, so go through a slice.
     Array(String, u64),
 }
 
-pub fn generate<'tcx>(tcx: TyCtxt<'tcx>, cos: &[Coroutine<'tcx>]) -> String {
-    let ids: HashMap<DefId, usize> = cos.iter().enumerate().map(|(i, c)| (c.def_id, i)).collect();
-    let serde = find_serde(tcx);
-    let kind = |ty: Ty<'tcx>| -> Result<Kind, String> {
+/// Decides how (and whether) each live local can be serialized.
+pub struct Planner<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    ids: HashMap<DefId, usize>,
+    serde: Option<(DefId, DefId)>,
+}
+
+impl<'tcx> Planner<'tcx> {
+    pub fn new(tcx: TyCtxt<'tcx>, cos: &[Coroutine<'tcx>]) -> Self {
+        let ids = cos.iter().enumerate().map(|(i, c)| (c.def_id, i)).collect();
+        let ser = find_trait(tcx, &["serde", "serde_core"], "Serialize");
+        let de = find_trait(tcx, &["serde", "serde_core"], "Deserialize");
+        Planner { tcx, ids, serde: ser.zip(de) }
+    }
+
+    fn is_serde(&self, ty: Ty<'tcx>) -> bool {
+        let Some((ser, de)) = self.serde else { return false };
+        implements(self.tcx, ser, ty, &[]) && implements(self.tcx, de, ty, &[self.tcx.lifetimes.re_static.into()])
+    }
+
+    fn kind(&self, ty: Ty<'tcx>) -> Result<Kind, String> {
         if let ty::Coroutine(d, _) = ty.kind() {
-            return match ids.get(d) {
+            return match self.ids.get(d) {
                 Some(i) => Ok(Kind::Nested(*i)),
                 None => Err(format!("no glue for nested `{ty}`")),
             };
@@ -105,80 +106,112 @@ pub fn generate<'tcx>(tcx: TyCtxt<'tcx>, cos: &[Coroutine<'tcx>]) -> String {
         if let Some(why) = unsupported(ty) {
             return Err(why);
         }
-        let Some(serde) = &serde else { return Err("serde is not in the crate graph".into()) };
+        if self.serde.is_none() {
+            return Err("serde is not in the crate graph".into());
+        }
         if let ty::Array(elem, len) = ty.kind()
-            && let Some(n) = len.try_to_target_usize(tcx)
-            && is_serde(tcx, serde, *elem)
+            && let Some(n) = len.try_to_target_usize(self.tcx)
+            && self.is_serde(*elem)
         {
             return Ok(Kind::Array(path(*elem), n));
         }
-        if !is_serde(tcx, serde, ty) {
+        if !self.is_serde(ty) {
             return Err(format!("`{ty}` does not implement Serialize + DeserializeOwned"));
         }
         Ok(Kind::Serde(path(ty)))
-    };
+    }
 
+    /// Live values of a state: its saved locals, plus upvars for non-fn coroutines.
+    pub fn live<'a>(&self, co: &'a Coroutine<'tcx>, st: &'a State<'tcx>) -> Vec<&'a Field<'tcx>> {
+        let mut fields: Vec<_> = st.fields.iter().collect();
+        if !co.is_fn_body {
+            fields.extend(co.upvars.iter());
+        }
+        fields
+    }
+
+    /// How to handle every live value, or the first one that cannot be handled.
+    pub fn plan<'a>(
+        &self,
+        co: &'a Coroutine<'tcx>,
+        st: &'a State<'tcx>,
+    ) -> Result<Vec<(&'a Field<'tcx>, Kind)>, (&'a Field<'tcx>, String)> {
+        self.live(co, st)
+            .into_iter()
+            .map(|f| {
+                if f.name.starts_with("_l") && f.ty.is_bool() {
+                    return Err((f, "looks like a drop flag".to_string()));
+                }
+                self.kind(f.ty).map(|k| (f, k)).map_err(|e| (f, e))
+            })
+            .collect()
+    }
+}
+
+/// The state's live locals and their types, sorted. Nested frames carry their own.
+fn signature(plan: &[(&Field<'_>, Kind)]) -> String {
+    let mut parts: Vec<String> = plan
+        .iter()
+        .map(|(f, k)| match k {
+            Kind::Nested(_) => format!("{}:<frame>", f.name),
+            Kind::Serde(t) => format!("{}:{t}", f.name),
+            Kind::Array(t, n) => format!("{}:[{t}; {n}]", f.name),
+        })
+        .collect();
+    parts.sort();
+    parts.join(",")
+}
+
+pub fn generate<'tcx>(tcx: TyCtxt<'tcx>, cos: &[Coroutine<'tcx>]) -> String {
+    let planner = Planner::new(tcx, cos);
     let mut s = String::new();
     s.push_str("// @generated by durable-driver from this crate's coroutine layouts. Do not edit.\n\n");
     for (i, co) in cos.iter().enumerate() {
         let name = co.ty.to_string();
+        let Some((tsize, toff)) = co.tag else {
+            let _ = writeln!(s, "unsafe fn __ser_{i}(_: *const u8) -> {RT}::Result<{RT}::Value> {{ Err(\"{name}: no tag\".into()) }}");
+            let _ = writeln!(s, "unsafe fn __de_{i}(_: &{RT}::Value, _: *mut u8) -> {RT}::Result<()> {{ Err(\"{name}: no tag\".into()) }}\n");
+            continue;
+        };
         let mut ser = String::new();
         let mut de = String::new();
         for st in co.states.iter().filter(|st| st.index >= 3) {
-            // Fields of this state, plus upvars that stay live (non-fn coroutines).
-            let mut fields: Vec<_> = st.fields.iter().collect();
-            if !co.is_fn_body {
-                fields.extend(co.upvars.iter());
-            }
-            let plan: Result<Vec<_>, String> = fields
-                .iter()
-                .map(|f| {
-                    if f.name.starts_with("_l") && f.ty.is_bool() {
-                        return Err(format!("`{}` looks like a drop flag", f.name));
-                    }
-                    kind(f.ty).map(|k| (*f, k)).map_err(|e| format!("{}: {e}", f.name))
-                })
-                .collect();
-            let plan = match plan {
+            let plan = match planner.plan(co, st) {
                 Ok(p) => p,
-                Err(why) => {
-                    let msg = format!("{name}: state {} at {} is not serializable: {why}", st.index, st.at);
+                Err((f, why)) => {
+                    let msg =
+                        format!("{name}: state {} at {} is not serializable: {}: {why}", st.index, st.at, f.name);
                     let _ = writeln!(ser, "        {} => Err({msg:?}.into()),", st.index);
                     let _ = writeln!(de, "        {} => Err({msg:?}.into()),", st.index);
                     continue;
                 }
             };
+            let sig = signature(&plan);
             let _ = writeln!(ser, "        {} => {{", st.index);
             let _ = writeln!(ser, "            let mut m = {RT}::Map::new();");
             let _ = writeln!(ser, "            m.insert(\"state\".into(), {}u64.into());", st.index);
+            let _ = writeln!(ser, "            m.insert(\"sig\".into(), {sig:?}.into());");
             let _ = writeln!(ser, "            m.insert(\"at\".into(), {:?}.into());", st.at);
             let _ = writeln!(de, "        {} => {{", st.index);
+            let _ = writeln!(de, "            {RT}::check_sig(v, {sig:?})?;");
             for (f, k) in &plan {
+                let (n, o) = (&f.name, f.offset);
                 match k {
                     Kind::Nested(j) => {
-                        let _ = writeln!(ser, "            m.insert({:?}.into(), __ser_{j}(p.add({}))?);", f.name, f.offset);
-                        let _ = writeln!(de, "            __de_{j}({RT}::field(v, {:?})?, p.add({}))?;", f.name, f.offset);
+                        let _ = writeln!(ser, "            m.insert({n:?}.into(), __ser_{j}(p.add({o}))?);");
+                        let _ = writeln!(de, "            __de_{j}({RT}::field(v, {n:?})?, p.add({o}))?;");
                     }
-                    Kind::Array(t, n) => {
-                        let _ = writeln!(
-                            ser,
-                            "            m.insert({:?}.into(), {RT}::ser_array::<{t}, {n}>(p.add({}))?);",
-                            f.name, f.offset
-                        );
-                        let _ = writeln!(de, "            {RT}::de_array::<{t}, {n}>(v, {:?}, p.add({}))?;", f.name, f.offset);
+                    Kind::Array(t, len) => {
+                        let _ = writeln!(ser, "            m.insert({n:?}.into(), {RT}::ser_array::<{t}, {len}>(p.add({o}))?);");
+                        let _ = writeln!(de, "            {RT}::de_array::<{t}, {len}>(v, {n:?}, p.add({o}))?;");
                     }
                     Kind::Serde(t) => {
-                        let _ = writeln!(
-                            ser,
-                            "            m.insert({:?}.into(), {RT}::ser_field::<{t}>(p.add({}))?);",
-                            f.name, f.offset
-                        );
-                        let _ = writeln!(de, "            {RT}::de_field::<{t}>(v, {:?}, p.add({}))?;", f.name, f.offset);
+                        let _ = writeln!(ser, "            m.insert({n:?}.into(), {RT}::ser_field::<{t}>(p.add({o}))?);");
+                        let _ = writeln!(de, "            {RT}::de_field::<{t}>(v, {n:?}, p.add({o}))?;");
                     }
                 }
             }
             let _ = writeln!(ser, "            Ok(m.into())\n        }}");
-            let (tsize, toff) = co.tag.unwrap();
             let _ = writeln!(
                 de,
                 "            ::core::ptr::write(p.add({toff}) as *mut {}, {});\n            Ok(())\n        }}",
@@ -186,19 +219,13 @@ pub fn generate<'tcx>(tcx: TyCtxt<'tcx>, cos: &[Coroutine<'tcx>]) -> String {
                 st.index
             );
         }
-        let Some((tsize, toff)) = co.tag else {
-            let _ = writeln!(s, "unsafe fn __ser_{i}(_: *const u8) -> {RT}::Result<{RT}::Value> {{ Err(\"{name}: no tag\".into()) }}");
-            let _ = writeln!(s, "unsafe fn __de_{i}(_: &{RT}::Value, _: *mut u8) -> {RT}::Result<()> {{ Err(\"{name}: no tag\".into()) }}\n");
-            continue;
-        };
-        let _ = writeln!(s, "// {name}");
-        let _ = writeln!(s, "#[allow(unused_mut, unused_unsafe, unused_variables, unreachable_code)]");
+        let allow = "#[allow(unused_mut, unused_unsafe, unused_variables, unreachable_code)]";
+        let _ = writeln!(s, "// {name}\n{allow}");
         let _ = writeln!(s, "unsafe fn __ser_{i}(p: *const u8) -> {RT}::Result<{RT}::Value> {{ unsafe {{");
         let _ = writeln!(s, "    match ::core::ptr::read(p.add({toff}) as *const {}) {{", uint(tsize));
         s.push_str(&ser);
         let _ = writeln!(s, "        t => Err(format!(\"{{}}: state {{}} is not a suspension point\", {name:?}, t)),");
-        let _ = writeln!(s, "    }}\n}}}}");
-        let _ = writeln!(s, "#[allow(unused_mut, unused_unsafe, unused_variables, unreachable_code)]");
+        let _ = writeln!(s, "    }}\n}}}}\n{allow}");
         let _ = writeln!(s, "unsafe fn __de_{i}(v: &{RT}::Value, p: *mut u8) -> {RT}::Result<()> {{ unsafe {{");
         let _ = writeln!(s, "    match {RT}::state(v)? {{");
         s.push_str(&de);

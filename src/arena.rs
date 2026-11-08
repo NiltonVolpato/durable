@@ -163,7 +163,10 @@ impl<F: Future> Task<F> {
         }
         let (off, _) = enter(arena.base.as_ptr(), || alloc_in_current(Layout::new::<F>()));
         unsafe { (*h).root_off = off };
-        let mut task = Task { arena, live: false, _f: PhantomData };
+        let mut task: Task<F> = Task { arena, live: false, _f: PhantomData };
+        // The root starts uninitialized (not zeroed), so that Miri flags any
+        // read of a byte `init` did not write.
+        unsafe { task.root_ptr().cast::<std::mem::MaybeUninit<F>>().write(std::mem::MaybeUninit::uninit()) };
         init(task.root_ptr())?;
         task.live = true;
         Ok(task)

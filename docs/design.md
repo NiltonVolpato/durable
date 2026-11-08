@@ -322,15 +322,69 @@ What it changes in the design:
 - The format is keyed by state number and local name, not offsets. In principle a recompile that keeps a function's await points and locals could still load old snapshots. Not tested yet.
 - Snapshots no longer depend on the target architecture.
 
-Open:
+### Compile-time lint (Option B, done)
 
-- Turn the per-state errors into compile errors at slow points (the lint): needs "which states are slow".
-- Not checked under Miri. Resume leaves non-live bytes uninitialized. That should be fine for `async fn` (only the live fields and the tag are read), but it is unverified. Under Miri the build flags differ, so the glue would need to be generated for Miri's build.
-- Generic coroutines, closures and `async` blocks with upvars held by a parent frame, drop flags.
+The driver also rejects, at compile time, any slow await whose live state cannot be serialized:
+
+- Slow leaves are marked with a trait: `pub trait SlowLeaf {}`, with `impl SlowLeaf for Slow`.
+- A state is slow if its `__awaitee` type, or any of its generic arguments, implements `SlowLeaf` or is a coroutine with a slow state (fixpoint over nesting).
+- At each slow state, every live value must pass the glue planner (serde impl, no references, no unnameable types, ...). Otherwise the driver emits an error and stops before generating glue.
+- Workflows on the raw-copy path opt out with `#[durable::raw]` (`#![feature(register_tool)] #![register_tool(durable)]`).
+
+```
+error: `iter` cannot be serialized at this slow await
+  --> examples/lint_fail.rs:17:24
+17 |         t += slow(*id).await;
+   |                        ^^^^^ the task can park here
+note: `iter` is live across the await: `std::slice::Iter<'_, u64>` has lifetimes
+16 |     for id in ids.iter() {
+   = help: make it serializable, end it before the await, or mark the workflow `#[durable::raw]`
+```
+
+`driver/lint-check.sh` builds `examples/lint_fail.rs` and gets 5 errors:
+
+- a borrow;
+- a hidden `for` iterator;
+- a type without serde impls;
+- a slow call inside `ephemeral`, reported both at the outer await and at the borrow inside the section.
+
+Fast awaits are not checked, so borrows across them need no annotation. Unlike Option A, a slow call inside an ephemeral section is now a compile error.
+
+### Loading snapshots into a changed build
+
+Each serialized state carries a `sig`: its live locals and their types, sorted. Deserialize requires an exact match. Nested frames carry their own. `driver/evolve-demo.sh` (`EVOLVE=1|2|3` selects a version of `evolve`):
+
+- **v1 → v2 (a new slow step after the parked one):** the frame grew from 80 to 88 B and `__awaitee` moved from offset 64 to 80. The v1 snapshot still loads by name, runs v2's new code, parks at the new step, and finishes (55).
+- **v1 → v3 (a new local live at the parked await):** refused with a diff of the two signatures.
+
+Limits:
+
+- States are numbered by await order. An await inserted *before* the parked one shifts the numbers. If the shifted state has the same signature, the task resumes at the wrong await. A stable key per await (for example a user label, or the callee plus its position in the function) would fix this.
+- Changes in behavior between versions are not checked; only the shape of the state is.
+
+### Miri (done)
+
+`driver/serde-test.sh` runs `tests/serde_roundtrip.rs` natively and under Miri. Each run uses glue generated with the matching flags, Miri's defaults plus `--cfg miri` (the result is identical to the native debug glue for this crate).
+
+What it covers:
+
+- heap data across two parks;
+- a nested frame;
+- a 64-byte array after an ephemeral section;
+- dropping a rebuilt frame without finishing it.
+
+`Task::new_with` marks the root slot as uninitialized before the glue writes into it, so any read of a byte the glue did not write is UB in Miri. Results:
+
+- No UB, no leaks. Resumed `async fn` code reads only the live fields and the tag.
+- Negative control: glue with one field removed (`label`) gives "reading memory ... but memory is uninitialized".
+
+### Still open
+
+- Generic coroutines, drop flags (currently refused), and closures or `async` blocks with upvars held by a parent frame.
 - Types are named by path from the glue module, so private types in other modules fail to compile in pass 2.
 - A failed deserialize leaks the fields written before the failure.
-- Glue from a different build: `Entry` checks size and alignment only. State numbering is not versioned yet.
-- The driver pins the project to rustc internals, which change on every nightly (several APIs changed between the 2025 docs and this nightly).
+- Stable state keys (see above).
+- The driver pins the project to rustc internals, which change on every nightly. Several APIs had already changed on this one.
 
 ## Known holes and open questions
 
@@ -363,7 +417,7 @@ Open questions:
 
 - Should a non-slow `Pending` with an eviction pending just wait, or should eviction only ever happen right after a slow park?
 - How long to keep old `.so` versions, and what to do with a snapshot whose `.so` is gone.
-- Is Option A enough in practice, or is the MIR lint worth building?
+- Is Option A enough in practice, or is the MIR lint worth building? Built for the serialized path (see the lint section); it could also check `Durable` at slow points for the raw-copy path.
 - Branded token for arena access, and whether it can also fix the aliasing hole.
 - How should the bump arena reclaim memory (abandoned `DVec` buffers, dead values)? And should arena values run destructors?
 
@@ -397,7 +451,12 @@ Native `async fn`, frame in a `Box`, hand-written poll loop with `Waker::noop()`
 
 ### Serialized-frame experiment: done
 
-See [Serialized frames](#serialized-frames-rustc_driver-experiment). `./build-glue.sh`, then `poc sstart profile 7` / `poc sresume`.
+See [Serialized frames](#serialized-frames-rustc_driver-experiment).
+
+- `./build-glue.sh`, then `poc sstart profile 7` / `poc sresume`.
+- `driver/lint-check.sh`: compile-time lint.
+- `driver/evolve-demo.sh`: old snapshot into a changed build.
+- `driver/serde-test.sh`: native + Miri round trips.
 
 ### v2: next
 

@@ -1,6 +1,9 @@
 //! Raw arena copy: `poc start <classify|triage|leaky|racy> <req_id>` / `poc resume`
 //! Serialized frames: `poc sstart <classify|profile|leaky|racy> <req_id>` / `poc sresume`
 
+#![feature(register_tool)]
+#![register_tool(durable)]
+
 use durable_poc::*;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
@@ -49,6 +52,7 @@ struct Note {
     weight: u64,
 }
 
+#[durable::raw] // arena handles: raw-copy path only
 async fn triage(req_id: u64) -> u64 {
     let mut history: DVec<u64> = DVec::new();
     for i in 1..=32 {
@@ -83,8 +87,39 @@ async fn profile(req_id: u64) -> u64 {
     (words.iter().map(|w| w.len()).sum::<usize>() + label.len()) as u64 + a + b
 }
 
+/// Versioned workflow for loading old snapshots into new builds (EVOLVE=1|2|3).
+#[cfg(evolve = "1")]
+async fn evolve(req_id: u64) -> u64 {
+    let words = vec![format!("req-{req_id}")];
+    let label = String::from("abuse");
+    let a = slow(req_id).await;
+    (words.len() + label.len()) as u64 + a + req_id
+}
+
+/// v2: a new slow step after the first. Same live locals at the first await.
+#[cfg(evolve = "2")]
+async fn evolve(req_id: u64) -> u64 {
+    let words = vec![format!("req-{req_id}")];
+    let label = String::from("abuse");
+    let a = slow(req_id).await;
+    println!("  v2: new step after the first slow call");
+    let b = slow(req_id + 1000).await;
+    (words.len() + label.len()) as u64 + a + b + req_id
+}
+
+/// v3: a new local live at the first await. Old snapshots must be refused.
+#[cfg(evolve = "3")]
+async fn evolve(req_id: u64) -> u64 {
+    let words = vec![format!("req-{req_id}")];
+    let label = String::from("abuse");
+    let retries: u32 = 0;
+    let a = slow(req_id).await;
+    (words.len() + label.len()) as u64 + a + req_id + retries as u64
+}
+
 /// Negative control: borrow of the frame across a slow await, forced past
 /// the check with ForceDurable. Correct answer for id 7, result 40: 47.
+#[durable::raw]
 async fn leaky(req_id: u64, body: [u8; 64]) -> u64 {
     let s = &body[..];
     let a = slow(req_id).await;
@@ -93,6 +128,7 @@ async fn leaky(req_id: u64, body: [u8; 64]) -> u64 {
 
 /// Negative control for Option A: a slow leaf and an ephemeral section in a
 /// join. The leaf parks before the section starts, so the leaf's assert passes.
+#[durable::raw]
 async fn racy(req_id: u64, body: [u8; 64]) -> u64 {
     let (a, quick) = join2(
         slow(req_id),
@@ -159,6 +195,13 @@ fn sresume() {
     match tag {
         "classify" => sdrive(glue::deserialize(g, || classify(0, b), ARENA_CAP, v).unwrap(), tag),
         "profile" => sdrive(glue::deserialize(g, || profile(0), ARENA_CAP, v).unwrap(), tag),
+        "evolve" => match glue::deserialize(g, || evolve(0), ARENA_CAP, v) {
+            Ok(t) => sdrive(t, tag),
+            Err(e) => {
+                eprintln!("cannot resume: {e}");
+                std::process::exit(3);
+            }
+        },
         t => panic!("unknown workflow {t}"),
     }
 }
@@ -195,6 +238,7 @@ fn main() {
             match tag {
                 "classify" => sdrive(Task::new(id, ARENA_CAP, classify(id, body)), tag),
                 "profile" => sdrive(Task::new(id, ARENA_CAP, profile(id)), tag),
+                "evolve" => sdrive(Task::new(id, ARENA_CAP, evolve(id)), tag),
                 "leaky" => sdrive(Task::new(id, ARENA_CAP, leaky(id, body)), tag),
                 "racy" => sdrive(Task::new(id, ARENA_CAP, racy(id, body)), tag),
                 w => panic!("unknown workflow {w}"),

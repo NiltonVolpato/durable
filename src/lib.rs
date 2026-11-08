@@ -47,6 +47,11 @@ impl !Durable for std::time::Instant {}
 
 // ---------- leaves ----------
 
+/// Marks leaf futures that can park a task for a long time. durable-driver
+/// treats any await that can reach one as a slow point.
+pub trait SlowLeaf {}
+impl SlowLeaf for Slow {}
+
 /// Slow leaf: ready once `results/<id>` exists, otherwise parks.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Slow {

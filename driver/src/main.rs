@@ -20,6 +20,7 @@ extern crate rustc_span;
 extern crate rustc_trait_selection;
 
 mod glue;
+mod lint;
 
 use rustc_abi::Variants;
 use rustc_driver::{Callbacks, Compilation};
@@ -34,11 +35,15 @@ pub struct Field<'tcx> {
     pub ty: Ty<'tcx>,
     pub offset: u64,
     pub local: usize,
+    /// Where the local is declared.
+    pub span: rustc_span::Span,
 }
 
 pub struct State<'tcx> {
     pub index: usize,
     pub at: String,
+    /// The await (or yield) that creates this state.
+    pub span: rustc_span::Span,
     pub fields: Vec<Field<'tcx>>,
 }
 
@@ -81,7 +86,13 @@ fn collect<'tcx>(tcx: TyCtxt<'tcx>) -> Vec<Coroutine<'tcx>> {
             .upvar_tys()
             .iter()
             .enumerate()
-            .map(|(i, t)| Field { name: format!("upvar{i}"), ty: t, offset: layout.fields.offset(i).bytes(), local: i })
+            .map(|(i, t)| Field {
+                name: format!("upvar{i}"),
+                ty: t,
+                offset: layout.fields.offset(i).bytes(),
+                local: i,
+                span: tcx.def_span(def_id),
+            })
             .collect();
         let mut co = Coroutine {
             def_id,
@@ -114,10 +125,11 @@ fn collect<'tcx>(tcx: TyCtxt<'tcx>) -> Vec<Coroutine<'tcx>> {
                             ty: saved.ty,
                             offset: offsets[f].bytes(),
                             local: local.as_usize(),
+                            span: saved.source_info.span,
                         }
                     })
                     .collect();
-                co.states.push(State { index: v.as_usize(), at, fields });
+                co.states.push(State { index: v.as_usize(), at, span, fields });
             }
         }
         out.push(co);
@@ -160,6 +172,9 @@ impl Callbacks for Driver {
         }
         if let Ok(path) = std::env::var("DURABLE_DUMP") {
             std::fs::write(path, dump(&cos)).unwrap();
+        }
+        if lint::check(tcx, &cos, &glue::Planner::new(tcx, &cos)) > 0 {
+            return Compilation::Stop;
         }
         let code = glue::generate(tcx, &cos);
         if let Ok(path) = std::env::var("DURABLE_GLUE_OUT") {

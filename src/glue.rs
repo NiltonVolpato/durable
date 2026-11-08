@@ -92,3 +92,15 @@ pub unsafe fn de_array<T: serde::de::DeserializeOwned, const N: usize>(v: &Value
     unsafe { (p as *mut [T; N]).write(arr) };
     Ok(())
 }
+
+/// A snapshot state loads only if its live locals and types are unchanged.
+pub fn check_sig(v: &Value, expected: &str) -> Result<()> {
+    let got = field(v, "sig")?.as_str().unwrap_or_default();
+    if got != expected {
+        return Err(format!(
+            "state {} at {} changed in this build:\n  snapshot: {got}\n  this build: {expected}",
+            v["state"], v["at"]
+        ));
+    }
+    Ok(())
+}
