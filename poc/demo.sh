@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end v0 demo: each `poc` call is a separate process.
 set -u
-./build-glue.sh >/dev/null || exit 1 # two-pass build with serde glue
+cd "$(dirname "$0")/.."
+poc/build-glue.sh >/dev/null || exit 1 # two-pass build with serde glue
 BIN="$(cargo metadata -q --format-version 1 --no-deps | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')/release/durable-poc"
 W="$(mktemp -d)"; mkdir -p "$W/results"; cd "$W" || exit 1
 

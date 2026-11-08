@@ -4,6 +4,8 @@ What each PoC step showed, how to run it, and what is left for an alpha ([overvi
 
 ## Layout
 
+The workspace is virtual. The alpha is `durable/`, `durable-macros/`, `driver/` and `apps/`; the proof of concept is `poc/` (crate `durable-poc`), `steps/` and `probe/`.
+
 | Path | What |
 |---|---|
 | `durable/`, `durable-macros/` | The alpha: runtime on SQLite, leaves, combinators, `#[workflow]`, `glue!()` |
@@ -11,16 +13,16 @@ What each PoC step showed, how to run it, and what is left for an alpha ([overvi
 | `apps/abuse/` | Alpha example (`demo.sh`) |
 | `apps/unsupported/` | Code outside the alpha subset and its errors (`check.sh`) |
 | `apps/moderation/`, `apps/billing/` | Examples: slow steps on both sides of a call; crash-safe side effects (`demo.sh`) |
-| `src/lib.rs` | `Durable`, leaves (`Slow`, `SleepUntil`), `Ephemeral`, `Join2`, `Select2`, `Structural`, raw-copy `run` |
-| `src/arena.rs` | `Task` (arena + header), `ABox`, `DVec`, `RelRef` |
-| `src/glue.rs` | Serialized-frame runtime (`serialize`, `deserialize`, helpers for generated code) |
-| `src/main.rs` | `poc` binary: raw copy (`start`/`resume`) and serialized (`sstart`/`sresume`) |
-| `src/compile_checks.rs` | Doctests for the `Durable` auto trait |
+| `poc/src/lib.rs` | `Durable`, leaves (`Slow`, `SleepUntil`), `Ephemeral`, `Join2`, `Select2`, `Structural`, raw-copy `run` |
+| `poc/src/arena.rs` | `Task` (arena + header), `ABox`, `DVec`, `RelRef` |
+| `poc/src/glue.rs` | Serialized-frame runtime (`serialize`, `deserialize`, helpers for generated code) |
+| `poc/src/main.rs` | `poc` binary: raw copy (`start`/`resume`) and serialized (`sstart`/`sresume`) |
+| `poc/src/compile_checks.rs` | Doctests for the `Durable` auto trait |
 | `driver/` | `durable-driver`: frame collection, glue, lint, drop flags |
 | `steps/`, `probe/` | SDK crate and the tokio probe |
-| `tests/roundtrip.rs` | Raw-copy round trips (Miri) |
-| `tests/serde_roundtrip.rs` | Serialized round trips (native + Miri, via `driver/serde-test.sh`) |
-| `examples/lint_fail.rs` | Workflows the lint must reject |
+| `poc/tests/roundtrip.rs` | Raw-copy round trips (Miri) |
+| `poc/tests/serde_roundtrip.rs` | Serialized round trips (native + Miri, via `driver/serde-test.sh`) |
+| `poc/examples/lint_fail.rs` | Workflows the lint must reject |
 
 ## How to run
 
@@ -30,17 +32,17 @@ apps/unsupported/check.sh                   # alpha: every unsupported case gets
 apps/moderation/demo.sh                     # scan -> per-client code -> review -> legal; scanner service
 apps/billing/demo.sh                        # charge -> invoice -> extend, with crashes
 target/debug/cargo-durable durable test -p durable --test runtime   # alpha runtime tests
-cargo test                                  # doctests + raw-copy round trip
-./demo.sh                                   # multi-process demo, both paths
-./build-glue.sh [pkg crate main]            # two-pass build with serde glue
+cargo test                                  # every crate; PoC doctests + raw-copy round trip
+poc/demo.sh                                 # PoC multi-process demo, both paths
+poc/build-glue.sh [pkg crate main]          # PoC two-pass build with serde glue
 probe/run.sh 7                              # realistic tokio workflow, 6 parks
 driver/lint-check.sh                        # the lint rejects examples/lint_fail.rs
 driver/evolve-demo.sh                       # old snapshot into a changed build
 driver/serde-test.sh                        # serialized round trips, native + Miri
-MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --test roundtrip
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p durable-poc --test roundtrip
 ```
 
-Run the binaries from `build-glue.sh` directly. A plain `cargo build` afterwards rebuilds them with an empty glue table.
+Run the binaries from `cargo durable` / `poc/build-glue.sh` directly. A plain `cargo build` afterwards rebuilds them with an empty glue table.
 
 ## Steps
 

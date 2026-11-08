@@ -1,11 +1,16 @@
-[package]
-name = "durable-poc"
-version = "0.1.0"
-edition = "2024"
-
 [workspace]
-members = ["driver", "steps", "probe", "durable", "durable-macros", "apps/abuse", "apps/unsupported", "apps/moderation", "apps/billing"]
-
-[dependencies]
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+resolver = "3"
+members = [
+    # the alpha
+    "durable",
+    "durable-macros",
+    "driver",
+    "apps/abuse",
+    "apps/billing",
+    "apps/moderation",
+    "apps/unsupported",
+    # the proof of concept
+    "poc",
+    "steps",
+    "probe",
+]

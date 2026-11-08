@@ -395,6 +395,11 @@ fn main() {
     if args.get(1).is_some_and(|a| a.ends_with("rustc")) {
         args.remove(1);
     }
+    // `cfg(durable)`: this crate is built by cargo durable, with its glue
+    // (e.g. tests that need the glue use `#![cfg(durable)]`).
+    if args.iter().any(|a| a == "--crate-name") {
+        args.extend(["--cfg".into(), "durable".into()]);
+    }
     rustc_driver::install_ice_hook("durable-driver", |_| ());
     let code = rustc_driver::catch_with_exit_code(|| rustc_driver::compiler_entrypoint(&args, &mut Driver));
     std::process::exit(if code == std::process::ExitCode::SUCCESS { 0 } else { 1 });

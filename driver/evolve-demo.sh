@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 TD="$(cargo metadata -q --format-version 1 --no-deps | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')"
 BIN="$TD/release/durable-poc"
 W="$(mktemp -d)"; mkdir -p "$W/results"
-build() { EVOLVE=$1 ./build-glue.sh >/dev/null || exit 1; echo "-- built v$1; layout of evolve:"; \
+build() { EVOLVE=$1 poc/build-glue.sh >/dev/null || exit 1; echo "-- built v$1; layout of evolve:"; \
           awk '/^coroutine .*evolve/{p=1;print;next} /^coroutine/{p=0} p' "$TD/durable/layout.txt"; }
 run() { (cd "$W" && "$BIN" "$@"); }
 

@@ -3,7 +3,7 @@
 #   usage: probe/run.sh <req_id>   (odd: note kept; even: note moved before the first park)
 set -uo pipefail
 cd "$(dirname "$0")/.."
-./build-glue.sh probe probe probe/src/main.rs >/dev/null || exit 1
+poc/build-glue.sh probe probe probe/src/main.rs >/dev/null || exit 1
 TD="$(cargo metadata -q --format-version 1 --no-deps | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')"
 BIN="$TD/release/probe"; ID=${1:-7}
 W="$(mktemp -d)"; mkdir -p "$W/results"; cd "$W"

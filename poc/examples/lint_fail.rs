@@ -1,5 +1,5 @@
 //! Workflows the durable-driver lint must reject. Build with
-//! `driver/lint-check.sh`; a plain `cargo build --example lint_fail` passes.
+//! `driver/lint-check.sh`; a plain `cargo build -p durable-poc --example lint_fail` passes.
 
 #![feature(register_tool)]
 #![register_tool(durable)]

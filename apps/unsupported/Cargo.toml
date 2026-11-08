@@ -9,3 +9,15 @@ description = "Code outside the alpha subset, and the errors it gets. Run check.
 durable = { path = "../../durable" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+# The examples are meant not to compile; only check.sh builds them.
+[features]
+check = []
+
+[[example]]
+name = "macro_errors"
+required-features = ["check"]
+
+[[example]]
+name = "lint_errors"
+required-features = ["check"]

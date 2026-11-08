@@ -1,5 +1,6 @@
-//! Runtime behavior end to end. Needs the generated glue:
-//! `cargo durable test -p durable --test runtime`.
+//! Runtime behavior end to end. Needs the generated glue, so it only exists
+//! in a durable build: `cargo durable test -p durable --test runtime`.
+#![cfg(durable)]
 
 use durable::{Either, Error, Outcome, Outgoing, Runtime, Status, request, select2, sleep_until};
 use std::cell::RefCell;

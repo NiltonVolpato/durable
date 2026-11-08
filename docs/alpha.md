@@ -9,6 +9,7 @@ The alpha supports a subset of Rust. Code outside the subset gets an error: at c
 - Toolchain: the nightly in `rust-toolchain.toml`, with `rustc-dev` and `llvm-tools`. The driver is tied to that exact nightly.
 - Build with `cargo durable build|run|test` (`driver/src/cargo_durable.rs`). It compiles workflow crates through `durable-driver`, which generates the serde glue and checks slow awaits. Install it with `cargo install --path driver` (it installs `cargo-durable` and `durable-driver`). In this repo you can use `target/debug/cargo-durable durable build -p <pkg>`.
 - A plain `cargo build` still compiles, but `Runtime::register` then fails: "no glue for workflow ...: build with `cargo durable build`".
+- Crates built by `cargo durable` get `cfg(durable)`. Tests that need the glue can use `#![cfg(durable)]`, so a plain `cargo test` skips them (see `durable/tests/runtime.rs`).
 
 ## Example
 

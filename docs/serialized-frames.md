@@ -2,7 +2,7 @@
 
 The main path ([overview](README.md)): a parked task is stored field by field. For every value live at the parked await, in every frame from the workflow root down to the slow leaf, the glue writes the value through serde. Resume builds a fresh frame and writes the values back. Heap data is fine; what cannot be serialized is rejected at compile time.
 
-Code: `driver/` (`durable-driver`), `src/glue.rs` (runtime side), `build-glue.sh`, `poc sstart|sresume`, `probe/`, `steps/`, `tests/serde_roundtrip.rs`.
+Code: `driver/` (`durable-driver`). In the alpha: `durable/src/glue.rs` and `cargo durable`. In the PoC: `poc/src/glue.rs`, `poc/build-glue.sh`, `poc sstart|sresume`, `probe/`, `steps/`, `poc/tests/serde_roundtrip.rs`.
 
 ## Why a compiler pass
 
@@ -30,10 +30,10 @@ Serializing a frame needs, for each suspension point, the live locals, their typ
 
 ## Glue generation
 
-`build-glue.sh [package crate main_file]` runs two builds:
+`poc/build-glue.sh [package crate main_file]` runs two builds (in the alpha, `cargo durable` does the same, see [alpha](alpha.md#setup)):
 
 1. Pass 1 builds with an empty glue table. The driver writes the glue.
-2. Pass 2 includes the glue (`build.rs` copies it to `$OUT_DIR/durable_glue.rs`). The driver regenerates it and fails the build if it differs, which confirms that adding the glue does not change any layout.
+2. Pass 2 includes the glue (in the PoC, `poc/build.rs` copies it to `$OUT_DIR/durable_glue.rs`; in the alpha, `durable::glue!()` includes it). The driver regenerates it and fails the build if it differs, which confirms that adding the glue does not change any layout.
 
 Generated code, per frame `i`:
 
@@ -98,7 +98,7 @@ note: `f` is live across the await: `std::fs::File` does not implement Serialize
            used after this point, `drop` it or close its block before the await
 ```
 
-`driver/lint-check.sh` builds `examples/lint_fail.rs` and gets 6 errors:
+`driver/lint-check.sh` builds `poc/examples/lint_fail.rs` and gets 6 errors (the alpha's equivalent is `apps/unsupported/check.sh`):
 
 - a borrow;
 - a hidden `for` iterator;
@@ -120,7 +120,7 @@ Limits:
 
 ## Miri
 
-`driver/serde-test.sh` runs `tests/serde_roundtrip.rs` natively and under Miri, each with glue generated using the matching flags. For Miri these are its defaults plus `--cfg miri`; the glue turned out identical to the native debug glue.
+`driver/serde-test.sh` runs `poc/tests/serde_roundtrip.rs` natively and under Miri, each with glue generated using the matching flags. For Miri these are its defaults plus `--cfg miri`; the glue turned out identical to the native debug glue.
 
 Covered:
 

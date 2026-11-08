@@ -13,3 +13,7 @@ tokio = { version = "1.54.1", features = ["sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[lints.rust]
+# Set by durable-driver (cargo durable) on the crates it builds.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(durable)"] }

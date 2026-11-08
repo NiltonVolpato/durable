@@ -2,7 +2,7 @@
 
 The original approach ([overview](README.md)): a parked task is stored as raw bytes. Its frame and data live in one arena, and everything in the arena refers to other things in it by offset, so the bytes can be copied to storage and back to any address, in another process. The compiler checks, through an auto trait, that nothing in a parked frame is an absolute pointer.
 
-Code: `src/lib.rs` (trait, `Ephemeral`, `run`), `src/arena.rs` (`Task`, `ABox`, `DVec`, `RelRef`), `poc start|resume`, `tests/roundtrip.rs`. Results: [status](status.md#v0) and [v1](status.md#v1).
+Code (in the `poc/` crate): `poc/src/lib.rs` (trait, `Ephemeral`, `run`), `poc/src/arena.rs` (`Task`, `ABox`, `DVec`, `RelRef`), `poc start|resume`, `poc/tests/roundtrip.rs`. Results: [status](status.md#v0) and [v1](status.md#v1).
 
 Snapshots are only valid for the exact build that wrote them; see [binary identity](runtime.md#binary-identity).
 

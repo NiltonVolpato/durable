@@ -1,0 +1,10 @@
+[package]
+name = "durable-poc"
+version = "0.1.0"
+edition = "2024"
+description = "Proof of concept: raw-copy durable futures and the first serialized-frame experiments. See docs/."
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

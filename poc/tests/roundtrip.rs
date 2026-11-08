@@ -1,5 +1,5 @@
 //! In-process evict/resume round trips. Also meant to run under Miri:
-//! `MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --test roundtrip`
+//! `MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p durable-poc --test roundtrip`
 
 use durable_poc::*;
 use std::future::Future;

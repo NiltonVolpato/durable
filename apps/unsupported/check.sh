@@ -10,7 +10,7 @@ check() { # example, expected message
 }
 for ex in macro_errors lint_errors; do
     echo "== $ex"
-    "$TD/debug/cargo-durable" durable build -q -p unsupported --example "$ex" >"$TD/durable/$ex.log" 2>&1 && { echo "  built?!"; fail=1; }
+    "$TD/debug/cargo-durable" durable build -q -p unsupported --features check --example "$ex" >"$TD/durable/$ex.log" 2>&1 && { echo "  built?!"; fail=1; }
 done
 check macro_errors "durable workflows cannot be generic"
 check macro_errors "methods cannot be durable workflows"
