@@ -10,6 +10,7 @@ What each PoC step showed, how to run it, and what is left for an alpha ([overvi
 | `driver/src/cargo_durable.rs` | `cargo durable build|run|test` |
 | `apps/abuse/` | Alpha example (`demo.sh`) |
 | `apps/unsupported/` | Code outside the alpha subset and its errors (`check.sh`) |
+| `apps/moderation/`, `apps/billing/` | Examples: slow steps on both sides of a call; crash-safe side effects (`demo.sh`) |
 | `src/lib.rs` | `Durable`, leaves (`Slow`, `SleepUntil`), `Ephemeral`, `Join2`, `Select2`, `Structural`, raw-copy `run` |
 | `src/arena.rs` | `Task` (arena + header), `ABox`, `DVec`, `RelRef` |
 | `src/glue.rs` | Serialized-frame runtime (`serialize`, `deserialize`, helpers for generated code) |
@@ -26,6 +27,8 @@ What each PoC step showed, how to run it, and what is left for an alpha ([overvi
 ```
 apps/abuse/demo.sh                          # alpha: abuse classification, one process per step
 apps/unsupported/check.sh                   # alpha: every unsupported case gets its error
+apps/moderation/demo.sh                     # scan -> per-client code -> review -> legal; scanner service
+apps/billing/demo.sh                        # charge -> invoice -> extend, with crashes
 target/debug/cargo-durable durable test -p durable --test runtime   # alpha runtime tests
 cargo test                                  # doctests + raw-copy round trip
 ./demo.sh                                   # multi-process demo, both paths
@@ -90,6 +93,12 @@ See [serialized frames](serialized-frames.md#realistic-probe-on-tokio).
   - slow leaves nested in opaque types (`Timeout<Request>`, `tokio::join!`) counted as fast;
   - types private to a module failed inside the generated code. The lint now names them.
 - Verified: `apps/abuse/demo.sh`, `apps/unsupported/check.sh` (10 cases), `durable/tests/runtime.rs` (8 tests: fast path, restart, duplicate, deadline + cancellation, panic, hidden slow call, incompatible snapshot, redispatch, missing glue). PoC flows unchanged.
+
+### Examples
+
+- `apps/moderation` (moderation with a scanner service), `apps/billing` (Flawless's `extend_subscription` with crashes). See [examples](alpha.md#examples).
+- New in the runtime: `handle(kind, async fn)` and `work()`, for in-process steps (the planned `step(f)`). At least once, with `(task_id, req_id)` as the idempotency key.
+- Found by `moderate`: a drop flag whose value is dropped field by field was not paired. This happens for structs without a `Drop` impl, and for enums after a discriminant switch. The MIR matcher now takes the saved local as a prefix of the dropped place.
 
 ## Road to an alpha
 

@@ -42,6 +42,13 @@ async fn hidden(x: u64) -> u64 {
     f.await
 }
 
+#[durable::workflow]
+async fn two_steps(x: u64) -> u64 {
+    let a: u64 = request("double", x).await;
+    let b: u64 = request("double", a).await;
+    b
+}
+
 type Log = Rc<RefCell<Vec<Outgoing>>>;
 
 fn db(name: &str) -> String {
@@ -59,6 +66,7 @@ fn runtime(path: &str) -> (Runtime, Log) {
     rt.register(deadline).unwrap();
     rt.register(boom).unwrap();
     rt.register(hidden).unwrap();
+    rt.register(two_steps).unwrap();
     (rt, log)
 }
 
@@ -160,4 +168,29 @@ async fn missing_glue_is_reported_at_register() {
     let mut rt = Runtime::open(&db("noglue"), &[], |_| {}).unwrap();
     let err = rt.register(one).unwrap_err();
     assert!(err.to_string().contains("cargo durable build"), "{err}");
+}
+
+#[tokio::test]
+async fn handlers_run_in_process_and_retry() {
+    let path = db("handlers");
+    let (mut rt, log) = runtime(&path);
+    let calls = Rc::new(RefCell::new(0));
+    let c = calls.clone();
+    rt.handle("double", move |o| {
+        let c = c.clone();
+        async move {
+            *c.borrow_mut() += 1;
+            if *c.borrow() == 2 {
+                return Err("flaky".to_string()); // the second call fails once
+            }
+            Ok(o.payload.as_u64().unwrap() * 2)
+        }
+    });
+    assert!(matches!(rt.start("t", two_steps(3)).await.unwrap(), Outcome::Parked));
+    assert!(log.borrow().is_empty(), "handled kinds are not dispatched");
+    rt.work().await.unwrap(); // step 1 ok, step 2 fails and stays pending
+    assert!(matches!(rt.status("t").unwrap(), Status::Parked { ref waiting, .. } if waiting == &[1]));
+    rt.work().await.unwrap(); // step 2 retried
+    assert_eq!(rt.status("t").unwrap(), Status::Done(serde_json::json!(12)));
+    assert_eq!(*calls.borrow(), 3);
 }

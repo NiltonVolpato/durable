@@ -23,13 +23,41 @@ How it works (from `docs/docs/infinity-runtime/architecture.md` in the repo):
 | Where the control flow lives | The LLM loop, which is fixed | User code: loops, joins, deadlines, retries |
 | Mechanism | Load → step → persist → exit | Serialize the frame at a slow await; rebuild it and keep polling |
 | Price | Only fits agent-shaped programs | rustc internals, and a long tail of language cases |
-| Maturity | A working runtime: stores, queues, Lambda | Mechanism proven; runtime not built yet |
+| Maturity | A working runtime: stores, queues, Lambda | Alpha: single-threaded runtime on SQLite |
 
 Infinity sidesteps capturing program state: for an LLM agent, the control state *is* the transcript, so it is data from the start. Durable futures target the opposite case: control flow written in Rust, with state that only the compiler can see.
 
 The two fit together. Orchestration that does not belong to the model could be written as a durable `async fn` inside an Infinity-style runtime: multi-step tool sequences, parallel calls with deadlines, retries.
 
 Its runtime design shapes our v2 plan: messages, per-task FIFO, processed ids, and persist-before-dispatch. See [runtime](runtime.md#lessons-from-infinity).
+
+## Flawless
+
+<https://flawless.dev/>. Durable Rust workflows by replay. Workflows are compiled to WebAssembly so that the code itself is deterministic. The results of side effects (HTTP calls, random numbers) are logged. After a crash the workflow re-runs from the start, and logged results replace the calls. A side effect that may or may not have happened returns `RequestInterrupted`, unless it is marked `.idempotent()`, in which case it is retried. The examples:
+
+- `extend_subscription`: charge via Stripe → email the invoice → extend the subscription. A crash in between leaves the system inconsistent without durability.
+- a long HTTP POST, plain and idempotent;
+- a workflow that picks a random xkcd comic, which is deterministic only because `rand` goes through the log.
+
+The same guarantees here, without replay: each side effect is a request, stored before it runs, with its result stored before the next step. A crash repeats at most the one step in flight, with the same idempotency key (`apps/billing`). Code between steps can use `rand` and the clock directly.
+
+## Lunatic
+
+<https://github.com/lunatic-solutions/lunatic>. An Erlang-style runtime on WebAssembly: lightweight, preemptively scheduled processes with isolation, supervision and distribution. Its examples are about processes (HTTP handlers, websockets, background email). It does not make processes durable.
+
+## Hand-written state machines plus replayed scripts
+
+A pattern seen in a large production system for the same use case:
+
+- Slow steps (malware scanning, ~15 minutes; manual review, 1–3 days) are hand-written state machines.
+- Per-client logic (user code, in Python and later Go) decides what happens after each result. It is re-executed from the start on every resume, with earlier results fed back in.
+
+That is replay, with its classic failure: any non-determinism in the client code (randomness, the clock, a config read) can take a different path on resume. The same problem appears twice:
+
+- in the client logic that decides the next step;
+- in the services that implement the slow calls, which keep their own hand-written state machines.
+
+`apps/moderation` models both sides as durable workflows.
 
 ## Replay-based durable execution
 

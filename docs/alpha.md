@@ -50,6 +50,16 @@ rt.deliver("r3", req_id, Decision { block: true }).await?;
 rt.run_due_timers().await?;
 ```
 
+## Examples
+
+| App | Shows |
+|---|---|
+| `apps/abuse` | Fast model first; two reviewers in parallel under a deadline; supervisor on a split or a timeout. |
+| `apps/moderation` | Slow steps on both sides of a call. `moderate`: malware scan (~15 min) → per-client code (`acme`, `globex`) → manual review (1–3 days) → legal review for some categories. The client code uses randomness (spot checks) and the clock (business hours) without determinism rules. `scan`: the scanner service as a workflow (submit to a sandbox, poll with durable sleeps, resubmit on crash). |
+| `apps/billing` | Flawless's `extend_subscription`: charge → invoice → extend, with a crash after each side effect. Handlers and idempotency keys give one charge and one email. |
+
+Each app has a `demo.sh` that runs one process per step.
+
 ## API
 
 | | |
@@ -65,6 +75,8 @@ rt.run_due_timers().await?;
 | `deliver(id, req_id, result)` | Records the result once, then runs the task until done or parked. Duplicate or late (cancelled) results are ignored. |
 | `run_due_timers()`, `next_wake()` | Resume tasks whose timer is due. |
 | `redispatch()` | Resend requests stored but not sent (crash between store and send). Call at startup. |
+| `handle(kind, async fn)` | Run requests of `kind` in this process (an HTTP call, a DB write) instead of dispatching them. At least once; use `(task_id, req_id)` as the idempotency key. |
+| `work()` | Run handlers for pending requests and due timers until idle. A failing handler's request stays pending. |
 | `status(id)`, `output::<T>(id)`, `snapshot(id)`, `open_requests()` | Inspection. |
 | `resume(id)` | Retry a task whose last resume failed (e.g. after deploying a compatible build). |
 
@@ -106,6 +118,12 @@ Across *fast* awaits anything goes: borrows, sockets, tokio types.
 | A snapshot from a build where that state changed | `Error::Incompatible`; the task **stays parked** with the error recorded; `resume` it from a compatible build | resume |
 
 `apps/unsupported/check.sh` compiles the compile-time cases and checks each error. `durable/tests/runtime.rs` covers the runtime ones.
+
+## Code that decides (the per-client scripts)
+
+The code between slow calls can be anything: user-written policy, randomness, the clock, a call to a config service. It is not re-run on resume, so it need not be deterministic. A decision made before a slow call is part of the stored state, and the task continues from it.
+
+The flip side: whatever is live at a slow await is frozen in the snapshot. If a policy or config should apply to tasks already waiting, read it *after* the slow call, not before.
 
 ## Deploys
 
