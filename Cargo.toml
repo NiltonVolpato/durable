@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["driver", "steps", "probe", "durable", "durable-macros", "apps/abuse", "apps/unsupported"]
+members = ["driver", "steps", "probe", "durable", "durable-macros", "apps/abuse", "apps/unsupported", "apps/moderation"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

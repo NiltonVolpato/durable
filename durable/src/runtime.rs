@@ -190,11 +190,15 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 ";
 
+/// Runs requests of one kind inside this process (see `Runtime::handle`).
+type Handler = Box<dyn Fn(Outgoing) -> Pin<Box<dyn Future<Output = Result<Value, String>>>>>;
+
 pub struct Runtime {
     db: Connection,
     glue: &'static [Entry],
     roots: HashMap<&'static str, Resume>,
     dispatch: Box<dyn Fn(&Outgoing)>,
+    handlers: HashMap<String, Handler>,
     locks: RefCell<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -205,7 +209,14 @@ impl Runtime {
     pub fn open(path: &str, glue: &'static [Entry], dispatch: impl Fn(&Outgoing) + 'static) -> Result<Self, Error> {
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
-        Ok(Runtime { db, glue, roots: HashMap::new(), dispatch: Box::new(dispatch), locks: RefCell::default() })
+        Ok(Runtime {
+            db,
+            glue,
+            roots: HashMap::new(),
+            dispatch: Box::new(dispatch),
+            handlers: HashMap::new(),
+            locks: RefCell::default(),
+        })
     }
 
     /// Register a workflow root, so that its parked tasks can be resumed.
@@ -223,6 +234,53 @@ impl Runtime {
         });
         self.roots.insert(entry.type_name, resume);
         Ok(())
+    }
+
+    /// Run requests of `kind` in this process instead of sending them to
+    /// `dispatch`: an automated step such as an HTTP call. `work` runs the
+    /// handler for each pending request and delivers its result.
+    ///
+    /// At least once: if the process dies after the side effect but before
+    /// the result is stored, the handler runs again for the same request.
+    /// Use `(task_id, req_id)` as the idempotency key.
+    pub fn handle<F, Fut, T>(&mut self, kind: &str, handler: F)
+    where
+        F: Fn(Outgoing) -> Fut + 'static,
+        Fut: Future<Output = Result<T, String>> + 'static,
+        T: Serialize,
+    {
+        let h: Handler = Box::new(move |o| {
+            let fut = handler(o);
+            Box::pin(async move { fut.await.map(|t| serde_json::to_value(t).expect("handler result must serialize")) })
+        });
+        self.handlers.insert(kind.to_string(), h);
+    }
+
+    /// Run handlers for pending requests and resume tasks whose timer is due,
+    /// until nothing is left to do now. A failing handler's request stays
+    /// pending for the next call. Returns the number of steps run.
+    pub async fn work(&self) -> Result<usize, Error> {
+        let mut total = 0;
+        loop {
+            let mut n = self.run_due_timers().await?.len();
+            let pending: Vec<Outgoing> =
+                self.open_requests()?.into_iter().filter(|o| self.handlers.contains_key(&o.kind)).collect();
+            for o in pending {
+                let (task, req) = (o.task_id.clone(), o.req_id);
+                match (self.handlers[&o.kind])(o).await {
+                    Ok(v) => {
+                        // An error here belongs to the task (recorded in its status).
+                        let _ = self.deliver(&task, req, v).await;
+                        n += 1;
+                    }
+                    Err(e) => eprintln!("durable: handler for {task} #{req} failed: {e}"),
+                }
+            }
+            if n == 0 {
+                return Ok(total);
+            }
+            total += n;
+        }
     }
 
     fn lock(&self, task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -511,12 +569,15 @@ impl Runtime {
             .query_map(params![task_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         for (req_id, kind, payload) in &pending {
-            (self.dispatch)(&Outgoing {
-                task_id: task_id.into(),
-                req_id: *req_id as u64,
-                kind: kind.clone(),
-                payload: serde_json::from_str(payload).unwrap_or(Value::Null),
-            });
+            // Handled kinds run in `work`; the rest go to `dispatch`.
+            if !self.handlers.contains_key(kind) {
+                (self.dispatch)(&Outgoing {
+                    task_id: task_id.into(),
+                    req_id: *req_id as u64,
+                    kind: kind.clone(),
+                    payload: serde_json::from_str(payload).unwrap_or(Value::Null),
+                });
+            }
             self.db.execute(
                 "UPDATE requests SET dispatched = 1 WHERE task_id = ?1 AND req_id = ?2",
                 params![task_id, req_id],

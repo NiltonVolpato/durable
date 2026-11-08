@@ -2,8 +2,10 @@
 //!
 //! Pattern (after the coroutine transform):
 //!   switchInt(copy ((*_n) as variant#V).F: bool) -> [0: bbA, otherwise: bbB]
-//!   bbB: ...; [goto ...;] drop(((*_n) as variant#W).G)
+//!   bbB: ...; [goto / switch on a discriminant ...;] drop(((*_n) as variant#W).G[.more])
 //! where `_n` points at the coroutine. Then saved local (V, F) guards (W, G).
+//! The drop may be of a field of G: a struct without a Drop impl is dropped
+//! field by field ("open drop"), and an enum after a switch on its discriminant.
 
 use rustc_middle::mir::{self, CoroutineLayout, CoroutineSavedLocal, Operand, Place, ProjectionElem, TerminatorKind};
 use rustc_middle::ty::{self, TyCtxt};
@@ -21,7 +23,7 @@ fn saved_local<'tcx>(
         _ => false,
     };
     match place.projection.as_slice() {
-        [ProjectionElem::Deref, ProjectionElem::Downcast(_, v), ProjectionElem::Field(f, _)] if points_at_self => {
+        [ProjectionElem::Deref, ProjectionElem::Downcast(_, v), ProjectionElem::Field(f, _), ..] if points_at_self => {
             cl.variant_fields.get(*v)?.get(*f).copied()
         }
         _ => None,
@@ -45,20 +47,25 @@ pub fn drop_flags<'tcx>(
             continue;
         };
         let Some(flag) = saved_local(body, def_id, cl, *p) else { continue };
-        // Follow gotos from the "initialized" branch to the drop.
-        let mut next = targets.otherwise();
-        for _ in 0..4 {
-            match &body.basic_blocks[next].terminator().kind {
-                TerminatorKind::Goto { target, .. } => next = *target,
-                TerminatorKind::Drop { place, .. } => {
-                    if let Some(val) = saved_local(body, def_id, cl, *place)
-                        && !out.contains(&(flag, val))
-                    {
-                        out.push((flag, val));
-                    }
-                    break;
+        // From the "initialized" branch, find the first drop of a saved local,
+        // through gotos and discriminant switches.
+        let mut queue = std::collections::VecDeque::from([targets.otherwise()]);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(b) = queue.pop_front() {
+            if !seen.insert(b) || seen.len() > 16 {
+                continue;
+            }
+            let term = body.basic_blocks[b].terminator();
+            if let TerminatorKind::Drop { place, .. } = &term.kind
+                && let Some(val) = saved_local(body, def_id, cl, *place)
+            {
+                if val != flag && !out.contains(&(flag, val)) {
+                    out.push((flag, val));
                 }
-                _ => break,
+                break;
+            }
+            if matches!(term.kind, TerminatorKind::Goto { .. } | TerminatorKind::SwitchInt { .. } | TerminatorKind::Drop { .. }) {
+                queue.extend(term.successors());
             }
         }
     }
