@@ -50,6 +50,32 @@ async fn two_steps(x: u64) -> u64 {
     b
 }
 
+thread_local! {
+    static RELEASED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A value whose destructor has a side effect. Without the opt-in,
+/// durable-driver rejects it at a slow await (see apps/unsupported).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Lease {
+    id: u64,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        RELEASED.with(|r| r.borrow_mut().push(self.id));
+    }
+}
+
+impl durable::DropOnPark for Lease {}
+
+#[durable::workflow]
+async fn leased(id: u64) -> u64 {
+    let lease = Lease { id };
+    let v: u64 = request("a", id).await;
+    v + lease.id
+}
+
 type Log = Rc<RefCell<Vec<Outgoing>>>;
 
 fn db(name: &str) -> String {
@@ -68,6 +94,7 @@ fn runtime(path: &str) -> (Runtime, Log) {
     rt.register(boom).unwrap();
     rt.register(hidden).unwrap();
     rt.register(two_steps).unwrap();
+    rt.register(leased).unwrap();
     (rt, log)
 }
 
@@ -194,4 +221,17 @@ async fn handlers_run_in_process_and_retry() {
     rt.work().await.unwrap(); // step 2 retried
     assert_eq!(rt.status("t").unwrap(), Status::Done(serde_json::json!(12)));
     assert_eq!(*calls.borrow(), 3);
+}
+
+/// What `DropOnPark` accepts: the destructor runs when the task parks, and
+/// again on the rebuilt copy.
+#[tokio::test]
+async fn opted_in_destructor_runs_at_park_and_at_end() {
+    let path = db("lease");
+    let (rt, _) = runtime(&path);
+    RELEASED.with(|r| r.borrow_mut().clear());
+    assert!(matches!(rt.start("t", leased(7)).await.unwrap(), Outcome::Parked));
+    assert_eq!(RELEASED.with(|r| r.borrow().clone()), vec![7]);
+    assert_eq!(rt.deliver("t", 0, 1u64).await.unwrap(), Status::Done(serde_json::json!(8)));
+    assert_eq!(RELEASED.with(|r| r.borrow().clone()), vec![7, 7]);
 }

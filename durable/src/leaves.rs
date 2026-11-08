@@ -13,6 +13,13 @@ use std::task::{Context, Poll};
 /// that can reach one as a slow point.
 pub trait SlowLeaf {}
 
+/// Opt-in for a type with a `Drop` impl (or a field with one) to be live at a
+/// slow await. Parking drops the in-memory frame, so the destructor runs at
+/// park, and again on the rebuilt copy when the scope really ends. Implement
+/// this only if that is harmless (memory only, idempotent, or the destructor
+/// tells the two apart). durable-driver rejects such types otherwise.
+pub trait DropOnPark {}
+
 /// An external call whose result is delivered later with `Runtime::deliver`.
 ///
 /// On first poll it gets a request id and is queued for dispatch; the request
@@ -36,6 +43,9 @@ pub fn request<T: DeserializeOwned>(kind: &str, payload: impl Serialize) -> Requ
 }
 
 impl<T> SlowLeaf for Request<T> {}
+
+/// Its destructor only cancels when dropped during a poll (see below).
+impl<T> DropOnPark for Request<T> {}
 
 impl<T: DeserializeOwned> Future for Request<T> {
     type Output = T;

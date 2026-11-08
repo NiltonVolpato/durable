@@ -69,6 +69,7 @@ Each app has a `demo.sh` that runs one process per step.
 | `durable::glue!()` | Once, at the crate root. Defines `GLUE`. |
 | `request::<T>(kind, payload)` | Slow call. Parks until `deliver(task, req_id, T)`. |
 | `sleep_until(ms)` | Durable timer, wall clock in ms (`now_ms()`). |
+| `DropOnPark` | Opt-in for a type whose destructor may run at park (see below). |
 | `join2`, `select2`, `Either` | Combinators usable at slow awaits. The loser of `select2` is dropped, which cancels its requests. |
 | `Runtime::open(path, GLUE, dispatch)` | `dispatch` sends a parked task's requests, after they are stored. |
 | `register(wf)` | Every root, at startup, before resuming anything. |
@@ -97,6 +98,8 @@ The values live at a slow await are stored, in every frame from the workflow dow
 - `join2` / `select2` of the above; `request` and `sleep_until`;
 - values moved conditionally before the await (drop flags).
 
+Parking drops the in-memory frame, so the destructor of a live value runs when the task parks, and again on the rebuilt copy when its scope really ends. std types (`String`, `Vec`, `HashMap`, ...) are fine: their destructors only free memory. A type with its own `Drop` impl, anywhere inside a live value (a field, a `Vec` element, a closure capture, an argument of an unstarted future), is rejected: a lease release, a metrics timer, a span guard, or "mark as abandoned on drop" would run twice. End it before the await, or, if running its destructor at park is harmless, opt in with `impl durable::DropOnPark for T {}` (`request` does: its destructor cancels only when dropped during a poll).
+
 Across *fast* awaits anything goes: borrows, sockets, tokio types.
 
 ## Everything else, and the error you get
@@ -109,6 +112,7 @@ Across *fast* awaits anything goes: borrows, sockets, tokio types.
 | A reference live at a slow await (including hidden temporaries, `for x in v.iter()`) | "`x` cannot be serialized at this slow await ... holds a reference" | compile (lint) |
 | A type without serde impls (`Arc<T>`, `File`, tokio types) | "... does not implement Serialize + DeserializeOwned" | compile (lint) |
 | A value kept only for its destructor | same, plus "`drop` it or close its block before the await" | compile (lint) |
+| A value with a user `Drop` impl inside (`struct Lease` with `impl Drop`), not `DropOnPark` | "`x` has a destructor that would run when the task parks" | compile (lint) |
 | A type private to its module | "... is private to its module ... make it `pub(crate)`" | compile (lint) |
 | `tokio::join!`, `tokio::select!`, `tokio::time::timeout` around a slow call | the `MaybeDone` / `Timeout` value cannot be serialized | compile (lint) |
 | An unstarted future held across a slow await (`Option<{async fn}>`) | "... holds an unnameable type" | compile (lint) |

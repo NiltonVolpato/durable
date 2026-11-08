@@ -9,11 +9,18 @@
 //! `tokio::join!`'s `PollFn<{closure}>`, `Ephemeral<{async block}>`).
 //! Type-erased futures (`Pin<Box<dyn Future>>`) count as fast: a slow leaf
 //! hidden there is only caught at run time, when serialization fails.
+//!
+//! Parking drops the in-memory frame, so a live value's destructor runs at
+//! park and again on the rebuilt copy. A live value whose type has a user
+//! `Drop` impl anywhere inside is rejected unless that type implements
+//! `durable::DropOnPark`. std types are trusted (their destructors only free
+//! memory), but their type arguments are checked.
 
 use crate::glue::{self, Kind, Planner};
 use crate::{Ctx, Field, Frame, Shape, State};
 use rustc_middle::ty::{self, Ty, TypeVisitableExt};
 use rustc_span::def_id::DefId;
+use std::collections::HashSet;
 
 fn awaitee<'a, 'tcx>(st: &'a State<'tcx>) -> Option<&'a Field<'tcx>> {
     st.fields.iter().find(|f| f.name == "__awaitee")
@@ -57,6 +64,72 @@ impl<'tcx> Slow<'_, 'tcx> {
     }
 }
 
+/// Finds user `Drop` impls that would run when a task parks.
+struct Drops<'a, 'tcx> {
+    cx: &'a Ctx<'tcx>,
+    frames: &'a [Frame<'tcx>],
+    planner: &'a Planner<'a, 'tcx>,
+    marker: DefId,
+}
+
+impl<'tcx> Drops<'_, 'tcx> {
+    fn opted_in(&self, ty: Ty<'tcx>) -> bool {
+        !ty.has_erased_regions() && !ty.has_escaping_bound_vars() && glue::implements(self.cx.tcx, self.marker, ty, &[])
+    }
+
+    /// The first type in `ty` with a user `Drop` impl and no opt-in.
+    fn in_type(&self, ty: Ty<'tcx>, seen: &mut HashSet<Ty<'tcx>>) -> Option<Ty<'tcx>> {
+        let tcx = self.cx.tcx;
+        if !seen.insert(ty) || !ty.needs_drop(tcx, ty::TypingEnv::fully_monomorphized()) {
+            return None;
+        }
+        match ty.kind() {
+            ty::Adt(def, _) if def.is_manually_drop() || def.is_phantom_data() => None,
+            ty::Adt(..) if self.opted_in(ty) => None,
+            ty::Adt(def, args) => {
+                if matches!(tcx.crate_name(def.did().krate).as_str(), "std" | "core" | "alloc") {
+                    return args.types().find_map(|t| self.in_type(t, seen));
+                }
+                if tcx.adt_destructor(def.did()).is_some() {
+                    return Some(ty);
+                }
+                def.all_fields().find_map(|f| self.in_type(self.cx.normalize(f.ty(tcx, *args)), seen))
+            }
+            ty::Tuple(ts) => ts.iter().find_map(|t| self.in_type(t, seen)),
+            ty::Array(t, _) | ty::Slice(t) => self.in_type(*t, seen),
+            _ => None,
+        }
+    }
+
+    /// The first value (by path) under `f` with a user `Drop` impl and no opt-in.
+    /// A nested coroutine that was polled (under `__awaitee`) is checked at its
+    /// own slow states; one that was not holds only its upvars.
+    fn in_value(&self, f: &Field<'tcx>, polled: bool, depth: usize) -> Option<(String, Ty<'tcx>)> {
+        let Some(j) = self.planner.id(f.ty) else {
+            return self.in_type(f.ty, &mut HashSet::new()).map(|t| (f.name.clone(), t));
+        };
+        if depth > 16 {
+            return None;
+        }
+        let polled = polled || f.name == "__awaitee";
+        let fields: Vec<&Field<'tcx>> = match &self.frames[j].shape {
+            Shape::Coroutine { .. } if polled => return None,
+            Shape::Coroutine { upvars, .. } => upvars.iter().collect(),
+            Shape::Fields(fields) => {
+                // A `Structural` struct with its own destructor.
+                if let ty::Adt(def, _) = f.ty.kind()
+                    && self.cx.tcx.adt_destructor(def.did()).is_some()
+                    && !self.opted_in(f.ty)
+                {
+                    return Some((f.name.clone(), f.ty));
+                }
+                fields.iter().collect()
+            }
+        };
+        fields.into_iter().find_map(|g| self.in_value(g, polled, depth + 1)).map(|(p, t)| (format!("{}.{p}", f.name), t))
+    }
+}
+
 /// Emit an error for each slow await that holds something unserializable.
 /// Returns the number of errors.
 pub fn check<'tcx>(cx: &Ctx<'tcx>, frames: &[Frame<'tcx>], planner: &Planner<'_, 'tcx>) -> usize {
@@ -74,8 +147,26 @@ pub fn check<'tcx>(cx: &Ctx<'tcx>, frames: &[Frame<'tcx>], planner: &Planner<'_,
             break;
         }
     }
-    let mut errors = 0;
-    let mut report = |st: &State<'tcx>, f: &Field<'tcx>, what: String, why: String| {
+    let drops = glue::find_trait(cx.tcx, &[cx.rt], "DropOnPark").map(|marker| Drops { cx, frames, planner, marker });
+    let errors = std::cell::Cell::new(0);
+    let drop_err = |st: &State<'tcx>, f: &Field<'tcx>, what: String, ty: Ty<'tcx>| {
+        cx.tcx
+            .dcx()
+            .struct_span_err(st.span, format!("`{what}` has a destructor that would run when the task parks"))
+            .with_span_label(st.span, "the task can park here")
+            .with_span_note(
+                f.span,
+                format!(
+                    "`{}` is live across the await; `{ty}` implements `Drop`, which runs when the parked task \
+                     is dropped from memory and again when the resumed copy goes out of scope",
+                    f.name
+                ),
+            )
+            .with_help("end it before the await, or implement `durable::DropOnPark` for it if running its destructor at park is harmless")
+            .emit();
+        errors.set(errors.get() + 1);
+    };
+    let report = |st: &State<'tcx>, f: &Field<'tcx>, what: String, why: String| {
         let mut d = cx
             .tcx
             .dcx()
@@ -91,7 +182,7 @@ pub fn check<'tcx>(cx: &Ctx<'tcx>, frames: &[Frame<'tcx>], planner: &Planner<'_,
             ));
         }
         d.emit();
-        errors += 1;
+        errors.set(errors.get() + 1);
     };
     for fr in frames {
         let Shape::Coroutine { states, .. } = &fr.shape else { continue };
@@ -105,11 +196,13 @@ pub fn check<'tcx>(cx: &Ctx<'tcx>, frames: &[Frame<'tcx>], planner: &Planner<'_,
                             && let Err(e) = planner.deep_check(*j, 0)
                         {
                             report(st, f, format!("{}.{e}", f.name).split(':').next().unwrap().to_string(), e);
+                        } else if let Some((what, ty)) = drops.as_ref().and_then(|d| d.in_value(f, false, 0)) {
+                            drop_err(st, f, what, ty);
                         }
                     }
                 }
             }
         }
     }
-    errors
+    errors.get()
 }

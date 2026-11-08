@@ -82,6 +82,7 @@ At compile time, the driver rejects any slow await whose live state cannot be se
   - a slow leaf;
   - a frame that can park (a coroutine, or a `Structural` combinator with such a field);
   - a type the driver cannot see into that has a slow leaf or such a frame nested anywhere inside it (`Timeout<Request<_>>`, `tokio::join!`'s closure, `Ephemeral<{async block}>`).
+- **Destructors.** Parking drops the frame, so live values' destructors run at park and again on the resumed copy. At slow awaits the lint also rejects any live value with a user `Drop` impl anywhere in its type (fields, std containers' type arguments, closure captures, an unstarted future's arguments) unless that type implements `durable::DropOnPark`. std/core/alloc types are trusted; `ManuallyDrop` and `PhantomData` are skipped. Coroutines under the awaitee are checked at their own slow states. Only in the alpha runtime (`durable`); the PoC has no marker trait.
 - **The check:** at each slow state, every live value must pass the glue rules, and so must every closure or combinator it holds, recursively.
 - **Not seen:** type-erased futures (`Pin<Box<dyn Future>>`) count as fast. A slow call hidden there is only caught at run time, when serialization fails.
 - **Fast awaits are not checked,** so borrows and tokio I/O across them need no annotation. Code not reachable from a root (the runtime, raw-copy workflows) is not checked.

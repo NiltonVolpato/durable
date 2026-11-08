@@ -54,7 +54,67 @@ async fn arc_state(id: u64) -> u64 {
     v + *shared
 }
 
+/// Serializable, but its destructor has a side effect: it would run at park
+/// and again at the end of the scope on resume.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Lease {
+    id: u64,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        println!("release {}", self.id);
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Job {
+    name: String,
+    leases: Vec<Lease>,
+}
+
+#[durable::workflow]
+async fn lease_across(id: u64) -> u64 {
+    let lease = Lease { id };
+    let v: u64 = request("a", id).await;
+    v + lease.id
+}
+
+/// The `Drop` impl is nested: a field, inside a `Vec`.
+#[durable::workflow]
+async fn nested_lease(id: u64) -> u64 {
+    let job = Job { name: "j".into(), leases: vec![Lease { id }] };
+    let v: u64 = request("a", id).await;
+    v + job.name.len() as u64
+}
+
+/// Captured by a closure live across the await.
+#[durable::workflow]
+async fn closure_lease(id: u64) -> u64 {
+    let lease = Lease { id };
+    let f = move || consume_now(lease);
+    let v: u64 = request("a", id).await;
+    v + f()
+}
+
+fn consume_now(l: Lease) -> u64 {
+    l.id
+}
+
+async fn consume(l: Lease) -> u64 {
+    l.id
+}
+
+/// Held by a future that has not started yet.
+#[durable::workflow]
+async fn unstarted_lease(id: u64) -> u64 {
+    let later = consume(Lease { id });
+    let v: u64 = request("a", id).await;
+    v + later.await
+}
+
 durable::glue!();
 fn main() {
     let _ = (private::private_type(1), borrow_across(1), tokio_join(1), tokio_timeout(1), option_of_future(1), arc_state(1));
+    let _ = (lease_across(1), nested_lease(1), closure_lease(1), unstarted_lease(1));
 }
