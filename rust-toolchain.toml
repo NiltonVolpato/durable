@@ -1,3 +1,5 @@
 [toolchain]
-channel = "nightly"
+# Pinned: durable-driver uses rustc's internal APIs, which change between nightlies.
+# Update this together with the driver (and rerun the checks in docs/status.md).
+channel = "nightly-2026-11-08"
 components = ["rust-src", "rustc-dev", "llvm-tools", "miri"]

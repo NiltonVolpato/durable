@@ -42,6 +42,8 @@ driver/serde-test.sh                        # serialized round trips, native + M
 MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p durable-poc --test roundtrip
 ```
 
+The toolchain is pinned (`rust-toolchain.toml`). After changing it, if Miri fails with `can't find crate for serde` (E0463), remove `<target dir>/miri`: cargo keeps the old dependency builds, but Miri's standard library is rebuilt per toolchain.
+
 Run the binaries from `cargo durable` / `poc/build-glue.sh` directly. A plain `cargo build` afterwards rebuilds them with an empty glue table.
 
 ## Steps

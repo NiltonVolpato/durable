@@ -50,7 +50,7 @@ Details in [docs/serialized-frames.md](docs/serialized-frames.md).
 
 ## Try it
 
-Requirements: the nightly in `rust-toolchain.toml` (rustup installs it, with `rustc-dev` and `llvm-tools`). Tested on macOS (arm64) and Linux (Ubuntu 24.04, x86_64).
+Requirements: `nightly-2026-11-08`, pinned in `rust-toolchain.toml` (rustup installs it, with `rustc-dev`, `llvm-tools` and `miri`). Tested on macOS (arm64) and Linux (Ubuntu 24.04, x86_64).
 
 ```sh
 cargo build -p durable-driver                       # builds durable-driver and cargo-durable
