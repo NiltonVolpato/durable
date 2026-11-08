@@ -9,11 +9,13 @@ A Rust async runtime where a native `async fn` can be suspended at a slow call, 
 The core ideas:
 
 - A `Durable` auto trait marks types that hold no absolute pointers. The compiler checks it structurally, the same way it checks `Send` on async blocks.
-- Each task lives in one contiguous arena. Pointers inside the arena are self-relative (`RelRef`), so the whole arena can be moved with a memcpy.
+- Each task lives in one contiguous arena. Pointers inside the arena are offsets (from the arena base, or self-relative `RelRef`), so the whole arena can be moved with a memcpy.
 - Only the state live at a slow call has to be durable. Fast sections can use borrows, tokio I/O and the heap freely.
 - Frame bytes are only valid for the code that wrote them. Workflows are built as shared libraries, named by the hash of the `.so`, and loaded with `dlopen` on resume.
 
 It needs nightly (`auto_traits`, `negative_impls`).
+
+Status: v0 and v1 of the PoC work (see [PoC status](#poc-status)). Tested on `rustc 1.102.0-nightly (2026-11-07)`, macOS arm64 (PIE).
 
 ## Motivating use case
 
@@ -33,20 +35,37 @@ What we want:
 ```rust
 #![feature(auto_traits, negative_impls)]
 
-/// Safety: the type holds no absolute addresses, and nothing outside
-/// the task arena holds the address of a value of this type.
+/// Safety: the type holds no absolute addresses or other process-local
+/// identity, and nothing outside the task arena holds its address.
 pub unsafe auto trait Durable {}
 
 impl<T: ?Sized> !Durable for &T {}
 impl<T: ?Sized> !Durable for &mut T {}
 impl<T: ?Sized> !Durable for *const T {}
 impl<T: ?Sized> !Durable for *mut T {}
-impl<T: ?Sized> !Durable for core::ptr::NonNull<T> {}
+
+// Process-local handles: plain integers inside, so they pass the
+// structural check, but are meaningless in another process.
+impl !Durable for std::os::fd::OwnedFd {}
+impl !Durable for std::fs::File {}
+impl !Durable for std::net::TcpStream {}
+// ... TcpListener, UdpSocket, Unix sockets, Child + stdio, ThreadId,
+// Instant (monotonic clock: use SystemTime instead).
 ```
 
-Because `NonNull` is excluded, `Box`, `Vec`, `String`, `Rc` and `Arc` are excluded too. `Waker` holds a vtable and a data pointer, so it is excluded.
+`NonNull` needs no impl of its own: it wraps a raw pointer (on recent nightlies a pattern type `*const T is !null`), so it is excluded structurally. So are `Box`, `Vec`, `String`, `Rc`, `Arc` and `AtomicPtr`. `Waker` holds a vtable and a data pointer, so it is excluded.
 
-Auto traits propagate through a coroutine's captured values and the values it holds across awaits. So `impl Future + Durable` makes the compiler check a native `async fn` with no macro.
+The handle list cannot be complete. It names std types; crates with their own handle newtypes (indices into process-wide tables, pids, tokio types once their `Arc` is gone) need their own negative impls. A negative impl on `OwnedFd` already covers every std type built on it.
+
+Auto traits propagate through a coroutine's captured values and the values it holds across awaits. So `impl Future + Durable` makes the compiler check a native `async fn` with no macro. Confirmed in v0, with the same diagnostics as `Send`:
+
+```
+note: future does not implement `Durable` as this value is used across an await
+3 |     let s = &body;   - has type `&[u8; 64]` which does not implement `Durable`
+4 |     let a = slow(id).await;   ^^^^^ await occurs here, with `s` maybe used later
+```
+
+The witness is computed from MIR liveness, so a borrow that ends before the await is accepted.
 
 Relation to `Unpin`:
 
@@ -63,30 +82,69 @@ The arena move goes against `Pin`'s drop guarantee: pinned memory must not be re
 
 ## Task arena and `RelRef`
 
-Each task owns one contiguous arena. The root future's frame is allocated in it, and so is any heap data the task keeps across slow calls. Eviction copies the used part of the arena. Resume copies it into a new arena at any address.
-
-Pointers inside the arena are self-relative:
+Each task owns one contiguous arena: a header, then the root future's frame, then bump-allocated task data. Eviction copies the used prefix. Resume copies it into a new arena at any address (same size and alignment).
 
 ```rust
-/// Offset from &self to the target. Valid only inside one task arena.
-pub struct RelRef<'a, T> {
-    off: isize,
-    _brand: PhantomData<fn(&'a ()) -> &'a ()>, // invariant arena brand
-    _pin: PhantomPinned,
-    _ty: PhantomData<T>,  // not PhantomData<&T>, which would be !Durable
+#[repr(C)]
+struct Header {        // offset 0, moves with the arena
+    task_id: u64,
+    parked: u64,       // slow event that parked during this poll, or NONE
+    cap: u32, align: u32, used: u32,
+    root_off: u32, root_size: u32,
+    ephemeral: u32,    // live ephemeral sections in this task
 }
-unsafe impl<'a, T: Durable> Durable for RelRef<'a, T> {}
 ```
 
-The brand lifetime ties a `RelRef` to its arena so it cannot escape or point into another arena. Several arenas can be live on one thread at once, and deref needs no context.
+All per-task runtime state lives in the header. The only thread-local is the base of the arena being polled, set around each poll and restored after (like tokio's current-task context). Nothing persists in it between polls, so it works with many tasks per thread.
 
-Costs of self-relative pointers:
+### Two kinds of in-arena pointer
 
-- A `RelRef` is `!Unpin`. It must be built in place through `Pin<&mut Self>`, at its final address. A constructor that returns it by value gives a wrong offset after the move.
-- It cannot be `Copy` or `Clone` in the usual way, since a copy sits at a different address. Cloning means recomputing the offset at the destination.
-- An arena container that reallocates (a `DVec` growing) memcpys its elements. Self-relative pointers stored in those elements break. Options: no growth after first use, a fix-up pass on growth, or store indices instead of pointers in elements.
+v1 showed that self-relative pointers cannot be held by the frame itself. The frame is in the arena, but user code moves frame locals freely (`let b = a;`, passing by value), and `!Unpin` does not stop moves of an owned value. Only `Pin<&mut T>` does, and that is a borrow, so it is `!Durable` across an await. So there are two kinds:
 
-The compiler's own borrows (`let s = &buf; x.await;`) are absolute pointers and cannot be made relative. Rust has no relative pointer type, even on nightly. So `RelRef` only covers user data. Compiler borrows must not be live at a slow call (next section).
+```rust
+/// Offset from the arena base. Plain value: the frame holds and moves it.
+/// Deref reads the current task's arena base; panics outside a poll.
+pub struct ABox<T> { off: u32, task: u64, _t: PhantomData<T> }
+pub struct DVec<T> { off: u32, len: u32, cap: u32, task: u64, _t: PhantomData<T> }
+
+/// Offset from &self. Deref needs no context. Lives only at stable
+/// addresses (arena data, pinned slots) and is set through Pin.
+pub struct RelRef<T> { off: isize, _pin: PhantomPinned, _t: PhantomData<T> }
+impl<T> RelRef<T> {
+    pub const fn null() -> Self;                         // the only by-value constructor
+    pub fn set(self: Pin<&mut Self>, target: &T);        // asserts both ends in this arena
+    pub fn get(&self) -> Option<&T>;
+}
+```
+
+- All are auto `Durable` when `T` is: no pointer fields, `PhantomData<T>` not `PhantomData<&T>`.
+- Handles store `task` and check it on deref, so a handle used in another task panics instead of reading the wrong arena.
+- `RelRef::set` asserts that both ends are inside the current arena. This runtime check replaces the brand lifetime for now.
+- `RelRef` is not `Clone`, and the API never hands one out by value once set, so it cannot be moved to a wrong address in safe code.
+- `RelRef::get` rebuilds the pointer with `with_exposed_provenance` (the arena base is exposed on allocation). Miri accepts this, with a warning.
+
+### `DVec` growth
+
+`DVec<T>` grows only if `T: Unpin`, because `Unpin` already means "safe to move on its own". `RelRef` is `!Unpin`, and so is any struct that holds one, so those vectors are fixed-capacity (`with_capacity` + `push_pinned`). A growable `push` of `!Unpin` elements does not compile (E0599). Old buffers are abandoned in the bump arena. Element destructors are not run.
+
+### Brand lifetime: deferred
+
+The planned `RelRef<'a, T>` brand needs a higher-ranked entry point (`for<'a> AsyncFnOnce(Token<'a>)`), which makes naming `F` for resume harder. A branded ZST token held in the frame would be `Durable`. It could also act as a GhostCell-style permission token (`&Token` to read, `&mut Token` to write), which would close the aliasing hole below. Not tried yet.
+
+### Is `RelRef` needed at all?
+
+Its only advantage over base-relative handles is that deref needs no context. But `ABox`/`DVec` already need the per-poll context, so that advantage buys little. A base-relative `ARef<T> { off: u32 }` could replace it:
+
+- It can be `Copy` and needs no `Pin`.
+- It works as a frame local.
+- A `DVec` of them can grow.
+- Cost: a thread-local read plus the task check on each deref, and no deref outside a poll.
+
+Leaning towards dropping `RelRef`.
+
+Known aliasing hole: `RelRef::get` returns `&T` without tracking it against `ABox::get_pin` / `DVec::get_pin` (`&mut` to the same target). Safe code can alias.
+
+The compiler's own borrows (`let s = &buf; x.await;`) are absolute pointers and cannot be made relative. Rust has no relative pointer type, even on nightly. So the arena only covers user data. Compiler borrows must not be live at a slow call (next section).
 
 ## Only slow calls need `Durable`
 
@@ -120,7 +178,13 @@ async fn classify(req: Req) -> Verdict {
 
 The `async {}` block's type is hidden inside `Ephemeral`, so the outer witness only sees `Ephemeral<_>: Durable`. The slow leaf checks the counter when polled. If it is nonzero, a slow call is running inside a fast section. The runtime then keeps that task in memory, or panics in debug builds. Pointers from an ephemeral section into outer frames are fine, because the section is gone before any eviction.
 
-Cost: one `ephemeral(...)` per fast section, and a slow call inside one is caught at run time, not compile time.
+The check in the leaf alone is not enough (found in v0). In `join(slow(..), ephemeral(..))` the slow leaf parks first, sees a counter of 0, and then the ephemeral section starts in the same poll. Evicting that task saved a live borrow, and the resume segfaulted. Fix: the runtime also checks before it evicts, and evicts only if the task is parked on a slow call and its counter is 0.
+
+The counter must be per task, not per thread: on tokio, task A's ephemeral section can stay pending while task B runs on the same thread. In v1 it lives in the arena header. Because the header moves with the arena, a bad eviction is also caught on resume.
+
+Open hole (found after v1): the counter only counts sections that have been polled. `let e = ephemeral(async { use(&body) }); slow().await; e.await` compiles, is evicted with the counter at 0, and crashed on resume (bus error). The unpolled section already holds its borrows. Fix: count from construction (`ephemeral()` runs inside a poll), not from first poll.
+
+Cost: one `ephemeral(...)` per fast section, and a slow call inside one is caught at run time, not compile time. Still not satisfying; open to a better idea.
 
 ### Option B: MIR lint (precise, needs a rustc\_driver)
 
@@ -141,7 +205,7 @@ This can likely sit on top of tokio. No custom executor seems necessary. The run
 
 Leaf futures:
 
-- `Slow<T>` / `wait_event(id)`: on poll, look up the result in the store. If missing, register `(task_id, event_id)` and the current waker in a table outside the arena, set a "parked on slow" flag for this poll, and return `Pending`. The leaf itself stores no `Waker`.
+- `Slow<T>` / `wait_event(id)`: on poll, look up the result in the store. If missing, register `(task_id, event_id)` and the current waker in a table outside the arena, set `header.parked` for this poll, and return `Pending`. The leaf itself stores no `Waker`.
 - `sleep_until(t)`: same, with a wall-clock deadline stored as an integer.
 - `step(f)`: runs an ordinary tokio future as a separate task keyed by ID and saves its output (which must be `Durable` or serializable) in the store. The frame holds only the ID. After a crash the step runs again, so steps are at-least-once.
 
@@ -150,7 +214,7 @@ Compiler-generated frames never store the `Context`, so the only wakers are in l
 Task lifecycle:
 
 1. A request starts as an ordinary in-memory task: a tokio task wrapping the arena and the root future.
-2. After each poll that returns `Pending` with the "parked on slow" flag set, the task may be evicted. Policy: right away, after a delay, or under memory pressure. The fast path never reaches this point.
+2. After each poll that returns `Pending` with `header.parked` set and `header.ephemeral == 0`, the task may be evicted. Policy: right away, after a delay, or under memory pressure. The fast path never reaches this point.
 3. Evict: copy the used part of the arena to the store with `(task_id, workflow_hash, size, align)`. Then `mem::forget` the in-memory future, since ownership is now on disk. Free the arena memory.
 4. When the event arrives, the result is written to the store and the task is marked ready.
 5. Resume: load the workflow `.so` for the hash, allocate an arena with the right size and alignment, copy the bytes in, and spawn a tokio task that polls the root future again.
@@ -184,6 +248,33 @@ pub struct WorkflowVTable {
 
 `HostVTable` gives the workflow access to the store, the event table and step spawning. Waking crosses the boundary as task and event IDs, not as Rust `Waker`s.
 
+Open problem (ignored for now): a `cdylib` statically links its own std and tokio. The `.so`'s tokio has its own runtime-context thread-local, so `tokio::spawn` or tokio I/O inside a workflow sees no runtime ("no reactor running"). That conflicts with "fast sections can use tokio freely". Linking std and tokio dynamically would fix it, but then updating their versions is hard. Other options: route fast I/O through `HostVTable`, or run a small runtime inside each `.so`.
+
+## Alternative: serialize frames instead of copying them
+
+Idea: make the coroutine `Serialize + Deserialize`, so a parked task is stored field by field instead of as raw bytes.
+
+No library can do this. Serializing a frame means knowing, at each suspension point, which saved locals are live, their types and their offsets. Only the compiler knows that, and the coroutine type is unnameable. A proc macro sees the same too-little as in Option B. The compiler already derives `Clone` for coroutines (`coroutine_clone`), but only for movable coroutines. `async fn` futures are immovable, and the check shows they get no `Clone` impl (E0277). The compiler cannot derive arbitrary traits structurally either.
+
+Possible route: a rustc_driver (the same machinery as Option B, needs `rustup component add rustc-dev llvm-tools`):
+
+- For each workflow coroutine, read `tcx.coroutine_layout(..)` (variant → saved locals → types) and `layout_of` (field offsets, discriminant, drop flags).
+- Generate per-variant glue: serialize the discriminant, then each live saved local through `T: Serialize` at its offset. Nested `async fn` frames recurse. Hand-written leaves and combinators implement serde by hand.
+- Check, at slow points only, that every live saved local is `Serialize + DeserializeOwned` (this replaces `Durable`).
+
+What it buys:
+
+- Heap types (`String`, `Vec`, `HashMap`, `Box`) can be held across slow calls. The arena and `RelRef` become unnecessary.
+- The format can be keyed by stable names (await point, local name) instead of layout, so some recompiles keep old snapshots valid. That partly addresses "a bug fix cannot reach parked tasks".
+- Snapshots stop depending on the architecture.
+
+What it costs:
+
+- A custom build step tied to rustc internals (unstable, changes per nightly).
+- Generated glue must use offsets from the same build as the frame.
+- Borrows at slow points are still forbidden.
+- Mapping a snapshot onto a changed coroutine stays fragile when await points or locals change.
+
 ## Known holes and open questions
 
 Holes in the structural check:
@@ -193,109 +284,62 @@ Holes in the structural check:
 - `PhantomData<&'a T>` is `!Durable` even though it holds no pointer, so some iterator and guard types fail for no real reason.
 - A pointer cast to `usize` passes the check. That needs unsafe code to use, so it is acceptable.
 - Pointers from outside the arena into it are invisible to the check (see the safety contract).
-- The frame copy includes padding bytes, which are uninitialized. Reading them as `&[u8]` is UB in theory, and Miri will flag it.
+- Process-local identity that is not a pointer passes structurally: fds, sockets, pids, indices into process-wide tables, monotonic `Instant`s. Dropping a restored fd closes an unrelated fd in the new process. Covered by explicit negative impls for std types; the list cannot be complete.
+- The frame copy includes padding bytes, which are uninitialized. Reading them as `&[u8]` is UB in theory. Miri does not flag the in-memory round trip (a plain memcpy keeps them uninit), but writing them to a file would count as a read.
+- Aliasing between `RelRef::get` and `get_pin` on the same target is not tracked (see the brand section).
+- PoC-only: `ForceDurable` is public and safe to construct, so safe code can bypass the check. It must become unsafe or demo-only.
+- Resume trusts the snapshot bytes. Today the binary maps a hand-picked tag to a workflow type (a wrong tag means a wrong type). A partial or corrupted write, or a tampered store, means arbitrary memory access. Needs: a type id generated from the workflow, a checksum, atomic writes (temp file + rename, or a DB transaction), and a store treated as trusted.
+
+Runtime gaps:
+
+- The arena is fixed-size and panics when full. Everything in it is relocatable, so it could grow between polls. Growing during a poll needs chunks or reserved virtual memory.
+- Two processes can resume the same snapshot and run it twice. Needs a lease or ownership row in the store.
+- What happens to a task that panics mid-poll?
+- Parked tasks run old code to completion; a bug fix cannot reach them. Needs a drain policy, or explicit migration points where state is serialized instead of copied.
+
+Answered:
+
+- Do user auto traits propagate through `async fn` witnesses like `Send`? Yes, with the same diagnostics (v0).
+- How does `DVec` grow? Only when `T: Unpin` (v1).
 
 Open questions:
 
-- Do user-defined auto traits propagate through `async fn` witnesses exactly like `Send`, with negative impls applied to borrows held across awaits? This is the first thing the PoC must confirm.
 - Should a non-slow `Pending` with an eviction pending just wait, or should eviction only ever happen right after a slow park?
-- How does `DVec` grow: no growth, fix-up, or index-based elements?
 - How long to keep old `.so` versions, and what to do with a snapshot whose `.so` is gone.
 - Is Option A enough in practice, or is the MIR lint worth building?
+- Branded token for arena access, and whether it can also fix the aliasing hole.
+- How should the bump arena reclaim memory (abandoned `DVec` buffers, dead values)? And should arena values run destructors?
 
-## PoC plan
+## PoC status
 
-Goal of v0: show that a native `async fn` can be suspended at a slow call, written to a file, and finished by a different process where the frame sits at a different address. Plus one compile-fail and one runtime-fail case.
+Code: `src/lib.rs` (trait, leaves, `Ephemeral`, `run`), `src/arena.rs` (`Task`, `ABox`, `DVec`, `RelRef`), `src/main.rs` (`poc` binary), `src/compile_checks.rs` (doctests), `tests/roundtrip.rs`, `demo.sh`.
 
-### v0 shortcuts
-
-- Nightly, `auto_traits` + `negative_impls`. One binary, no `.so`, no SQLite, no tokio.
-- A hand-written poll loop with `Waker::noop()`.
-- No arena yet. The frame lives in a `Box<F>` and holds only plain data (`u64`, `[u8; N]`).
-- Build ID = hash of `/proc/self/exe`, checked on resume.
-- Option A (`Ephemeral` + thread-local counter) for fast sections.
-- Ignore padding UB and the fn-pointer hole.
-
-### v0 code sketch (not compiled)
-
-```rust
-thread_local! {
-    static PARKED: Cell<Option<u64>> = Cell::new(None);
-    static EPHEMERAL: Cell<usize> = Cell::new(0);
-}
-
-pub struct Slow { id: u64 }
-impl Future for Slow {
-    type Output = u64;
-    fn poll(self: Pin<&mut Self>, _: &mut Context) -> Poll<u64> {
-        assert_eq!(EPHEMERAL.get(), 0, "slow call inside ephemeral section");
-        match std::fs::read_to_string(format!("results/{}", self.id)) {
-            Ok(s) => Poll::Ready(s.trim().parse().unwrap()),
-            Err(_) => { PARKED.set(Some(self.id)); Poll::Pending }
-        }
-    }
-}
-
-fn run<F: Future + Durable>(mut fut: Pin<Box<F>>, path: &str) -> Option<F::Output> {
-    let mut cx = Context::from_waker(Waker::noop());
-    loop {
-        PARKED.set(None);
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return Some(v),
-            Poll::Pending if PARKED.get().is_some() => {
-                let p = &*fut as *const F as *const u8;
-                let bytes = unsafe { std::slice::from_raw_parts(p, size_of::<F>()) };
-                write_snapshot(path, build_id(), bytes);
-                std::mem::forget(fut); // ownership is now on disk
-                return None;
-            }
-            Poll::Pending => continue, // non-slow yield: poll again
-        }
-    }
-}
-
-/// `ctor` is only used to infer the unnameable F from the async fn item.
-fn resume<A, F: Future + Durable>(_ctor: impl Fn(A) -> F, bytes: &[u8]) -> Pin<Box<F>> {
-    assert_eq!(bytes.len(), size_of::<F>());
-    let mut b = Box::<F>::new_uninit();
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.as_mut_ptr() as *mut u8, bytes.len());
-        Box::into_pin(b.assume_init())
-    }
-}
-
-async fn classify(req_id: u64, body: [u8; 64]) -> u64 {
-    let quick = ephemeral(async {
-        let s = &body[..];       // borrow, allowed inside ephemeral
-        yield_once().await;      // a non-slow await
-        s.iter().map(|&b| b as u64).sum::<u64>()
-    }).await;
-    if quick % 2 == 0 { return quick; }
-    let a = Slow { id: req_id }.await;
-    let b = Slow { id: req_id + 1000 }.await;
-    quick + a + b
-}
+```
+cargo test                    # compile checks + in-process round trip
+./demo.sh                     # multi-process demo
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --test roundtrip
 ```
 
-### v0 demo
+### v0: done
 
-1. `poc start 7`: prints the frame address, writes `snap.bin`, exits.
-2. `echo 40 > results/7; poc resume`: prints a different frame address, passes the first slow call, parks on the second, writes the snapshot again.
-3. `echo 2 > results/1007; poc resume`: prints the final sum.
-4. Build as PIE so ASLR moves addresses between runs.
-5. Compile-fail: hold `let s = &body;` across a `Slow` await in the outer fn. `run`'s `F: Durable` bound should reject it, and the error should name the borrow.
-6. Runtime-fail: put a `Slow` await inside `ephemeral`. The assert fires.
+Native `async fn`, frame in a `Box`, hand-written poll loop with `Waker::noop()`, snapshot checked against a hash of the executable.
 
-Steps 5 and 6 test the main open question: that user auto traits propagate through `async fn` witnesses.
+- `poc start classify 7` → park → `resume` → park on the nested fn's slow call → `resume` → 49. Three processes, frame at a different address each time.
+- Compile checks: borrows, `String`, `&'static str`, and hidden temporaries (`for x in v.iter()`, `match &x`, `f(&x, slow().await)`) held across a slow await are rejected. Dead borrows and nested async fns are accepted.
+- Ephemeral: a slow call inside a section fires the leaf's assert.
+- Negative controls: forcing a frame borrow past the check (`ForceDurable`) gives a segfault, bus error or wrong answer on resume. The `join(slow, ephemeral)` case led to the eviction-time check (Option A section).
 
-### v1
+### v1: done
 
-- A fixed-size task arena. The root future and task data are allocated in it.
-- `RelRef<'a, T>`, self-relative, built in place through `Pin`.
-- One arena `DVec` (no growth after first slow call) held across a slow await, holding a `RelRef` to another arena value. Shows heap data surviving the move.
+- Fixed-size task arena (64 KiB) with the header, root frame and task data. Eviction copies only the used prefix (264 B for `classify`, 640–1152 B for `triage`).
+- `ABox`, `DVec` (grows iff `T: Unpin`) and `RelRef` (self-relative, set through `Pin`).
+- `triage` workflow: a `DVec<u64>` that grows before and after resume, an `ABox<Note>`, and a fixed-capacity `DVec<RelRef<Note>>` pointing at it, all held across two slow awaits. Finishes in a third process with 574. The `RelRef` resolves to the same offset in each new arena.
+- Negative impls for OS handles and `Instant`, with compile checks.
+- `tests/roundtrip.rs` passes under Miri (evict → scribble over old bytes → resume into a fresh arena, twice), apart from the expected warning from `with_exposed_provenance`.
 
-### v2
+### v2: next
 
-- Workflow as `cdylib` with the C ABI vtable, stored as `workflow_<hash>.so`, loaded with `dlopen`.
+- Workflow as `cdylib` with the C ABI vtable, stored as `workflow_<hash>.so`, loaded with `dlopen`. The tokio-in-cdylib problem is set aside for now.
 - SQLite store behind a `Store` trait.
 - tokio-hosted tasks, `step(f)` for non-durable work, eviction policy for the fast/slow split.
+- Maybe: branded token for arena access.

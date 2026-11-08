@@ -11,6 +11,11 @@ echo 40 > results/7;    echo "== resume"; "$BIN" resume
 echo 2 > results/1007;  echo "== resume"; "$BIN" resume   # expect 49
 
 rm -f snap.bin results/*
+echo "== triage: DVec + ABox + RelRef across slow calls"; "$BIN" start triage 7
+echo 40 > results/7;    echo "== resume"; "$BIN" resume
+echo 2 > results/1007;  echo "== resume"; "$BIN" resume   # expect 528+40+3*2=574
+
+rm -f snap.bin results/*
 echo "== leaky (borrow forced past check): expect crash/garbage"
 "$BIN" start leaky 7; echo 40 > results/7; "$BIN" resume; echo "exit=$?"
 
