@@ -77,6 +77,20 @@ async fn leased(id: u64) -> u64 {
     v + lease.id
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Config {
+    bonus: u64,
+}
+
+/// Immutable shared values: a copy on resume behaves the same, so allowed.
+#[durable::workflow]
+async fn shared_config(x: u64) -> String {
+    let cfg = std::sync::Arc::new(Config { bonus: 100 });
+    let name: std::sync::Arc<str> = "n".into();
+    let a: u64 = request("a", x).await;
+    format!("{name}{}", a + cfg.bonus)
+}
+
 type Log = Rc<RefCell<Vec<Outgoing>>>;
 
 fn db(name: &str) -> String {
@@ -96,6 +110,7 @@ fn runtime(path: &str) -> (Runtime, Log) {
     rt.register(hidden).unwrap();
     rt.register(two_steps).unwrap();
     rt.register(leased).unwrap();
+    rt.register(shared_config).unwrap();
     (rt, log)
 }
 
@@ -240,4 +255,12 @@ async fn opted_in_destructor_sees_parking() {
     assert_eq!(rt.deliver("t", 0, 1u64).await.unwrap(), Status::Done(serde_json::json!(8)));
     assert_eq!(released(), vec![(7, false)]);
     assert!(!durable::is_parking());
+}
+
+#[tokio::test]
+async fn immutable_arc_survives_park() {
+    let path = db("arc");
+    let (rt, _) = runtime(&path);
+    assert!(matches!(rt.start("t", shared_config(1)).await.unwrap(), Outcome::Parked));
+    assert_eq!(rt.deliver("t", 0, 2u64).await.unwrap(), Status::Done(serde_json::json!("n102")));
 }

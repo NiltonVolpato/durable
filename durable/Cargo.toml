@@ -12,6 +12,8 @@ serde_json = "1"
 tokio = { version = "1.54.1", features = ["sync", "time"] }
 
 [dev-dependencies]
+# `rc`: tests hold immutable `Arc`s across slow awaits.
+serde = { version = "1", features = ["derive", "rc"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 
 [lints.rust]

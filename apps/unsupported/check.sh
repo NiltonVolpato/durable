@@ -16,16 +16,23 @@ check macro_errors "durable workflows cannot be generic"
 check macro_errors "methods cannot be durable workflows"
 check macro_errors "goes on an \`async fn\`"
 [ "$(grep -c 'durable workflows cannot be generic' "$TD/durable/macro_errors.log")" -ge 2 ] && echo "  ok    both generic forms" || { echo "  MISSING impl-Trait form"; fail=1; }
+# Glue limit
 check lint_errors "is private to its module"
+# Borrow
 check lint_errors "\`r\` is live across the await: \`&str\` holds a reference"
+# Opaque
 check lint_errors "tokio::future::maybe_done::MaybeDone"
-check lint_errors "tokio::time::Timeout"
+check lint_errors "\`tokio::time::Timeout<durable::Request<u64>>\` does not implement Serialize"
 check lint_errors "\`later\` is live across the await"
-check lint_errors "\`std::sync::Arc<u64>\` holds a shared pointer"
-check lint_errors "\`Shared\` holds a shared pointer (\`std::rc::Rc<std::vec::Vec<std::string::String>>\`)"
+# Effect
 check lint_errors "\`lease\` has a destructor that would run when the task parks"
 check lint_errors "\`job\` is live across the await; \`Lease\` implements \`Drop\`"
 check lint_errors "\`f.c0\` has a destructor"
 check lint_errors "\`later.upvar0\` has a destructor"
+# Identity
+check lint_errors "\`std::sync::Arc<std::sync::Mutex<u64>>\` is shared and mutable through \`std::sync::Mutex<u64>\`"
+check lint_errors "\`Shared\` holds \`std::rc::Rc<std::cell::RefCell<std::vec::Vec<std::string::String>>>\`, which is shared and mutable"
+check lint_errors "is shared and mutable through \`std::cell::Cell<u64>\`"
+check lint_errors "\`std::sync::Weak<u64>\` is a \`Weak\`; a stored one comes back empty"
 echo "full output: $TD/durable/{macro_errors,lint_errors}.log"
 exit $fail

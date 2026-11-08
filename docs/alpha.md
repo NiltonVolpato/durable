@@ -100,7 +100,16 @@ The values live at a slow await are stored, in every frame from the workflow dow
 
 Parking drops the in-memory frame, so the destructor of a live value runs when the task parks, and again on the rebuilt copy when its scope really ends. std types (`String`, `Vec`, `HashMap`, ...) are fine: their destructors only free memory. A type with its own `Drop` impl, anywhere inside a live value (a field, a `Vec` element, a closure capture, an argument of an unstarted future), is rejected: a lease release, a metrics timer, a span guard, or "mark as abandoned on drop" would run twice. End it before the await, or opt in with `impl durable::DropOnPark for T {}` and skip the side effect while `durable::is_parking()` is true (the runtime sets it only while dropping a frame it has stored; if storing fails, the drop is a real end). `request` opts in: its destructor cancels only when dropped during a poll.
 
-`Rc`, `Arc` and their `Weak`s are rejected anywhere inside a live value, even when serde's `rc` feature gives them serde impls: each resume would get a private copy, and other holders would no longer share it.
+`Rc` / `Arc` (with serde's `rc` feature) are allowed when what they point to is immutable (`Arc<str>`, `Arc<Config>`): the copy each resume gets behaves the same. They are rejected when it can be mutated through them (`Arc<Mutex<_>>`, `Rc<RefCell<_>>`, `Arc<Vec<Cell<_>>>`), since other holders would no longer share it. A `Weak` is always rejected: a stored one comes back empty.
+
+Put together, a value stored at a slow await must serialize and have none of:
+
+- **Borrow**: references, iterators (lifetimes).
+- **Effect**: a destructor with a side effect (`Drop` without `DropOnPark`).
+- **Opaque**: state the driver cannot see or name (`dyn`, unnameable types, foreign futures without serde impls).
+- **Identity**: sharing a copy loses (`Rc` / `Arc` to mutable data, `Weak`).
+
+`apps/unsupported/examples/lint_errors.rs` labels each rejected case with its class. A case that fits none of them is a gap in this model.
 
 Across *fast* awaits anything goes: borrows, sockets, tokio types.
 
@@ -112,7 +121,7 @@ Across *fast* awaits anything goes: borrows, sockets, tokio types.
 | Method workflow (`&self`) | "methods cannot be durable workflows (alpha)" | compile (macro) |
 | `#[durable::workflow]` on a non-async fn | "goes on an `async fn`" | compile (macro) |
 | A reference live at a slow await (including hidden temporaries, `for x in v.iter()`) | "`x` cannot be serialized at this slow await ... holds a reference" | compile (lint) |
-| `Rc` / `Arc` / `Weak` anywhere inside a value, with or without serde's `rc` feature | "... holds a shared pointer ...; a stored copy would no longer be shared" | compile (lint) |
+| With serde's `rc` feature: `Rc` / `Arc` to mutable data, or a `Weak`, anywhere inside a value | "... is shared and mutable through `Mutex<u64>`; a stored copy would no longer be shared" / "... is a `Weak`" | compile (lint) |
 | A type without serde impls (`File`, tokio types) | "... does not implement Serialize + DeserializeOwned" | compile (lint) |
 | A value kept only for its destructor | same, plus "`drop` it or close its block before the await" | compile (lint) |
 | A value with a user `Drop` impl inside (`struct Lease` with `impl Drop`), not `DropOnPark` | "`x` has a destructor that would run when the task parks" | compile (lint) |

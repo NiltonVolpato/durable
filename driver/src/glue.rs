@@ -96,17 +96,36 @@ pub fn find_owned<'tcx>(cx: &Ctx<'tcx>, ty: Ty<'tcx>, visit: &mut impl FnMut(Ty<
     go(cx, ty, visit, &mut HashSet::new())
 }
 
-/// `Rc`, `Arc` or a `Weak`: with serde's `rc` feature they serialize, but
-/// each resume gets a private copy, so other holders no longer share it.
-fn shared_pointer<'tcx>(cx: &Ctx<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+/// A type in `ty`, owned or behind owning pointers (`Box`, `Vec`, ...), with
+/// interior mutability. `is_freeze` alone stops at those pointers.
+fn mutable_inside<'tcx>(cx: &Ctx<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+    let env = ty::TypingEnv::fully_monomorphized();
+    find_owned(cx, ty, &mut |t| if t.is_freeze(cx.tcx, env) { Step::Descend } else { Step::Found })
+}
+
+/// Shared identity a snapshot loses. With serde's `rc` feature, `Rc` / `Arc`
+/// serialize, but each resume gets a private copy: harmless if the pointee is
+/// immutable, not if it can be mutated through the pointer. A deserialized
+/// `Weak` is always empty.
+fn lost_identity<'tcx>(cx: &Ctx<'tcx>, ty: Ty<'tcx>) -> Option<String> {
     use rustc_span::sym;
-    find_owned(cx, ty, &mut |t| match t.kind() {
-        ty::Adt(def, _)
-            if [sym::Rc, sym::Arc, sym::RcWeak, sym::ArcWeak].iter().any(|s| cx.tcx.is_diagnostic_item(*s, def.did())) =>
-        {
-            Step::Found
-        }
+    let is = |did, items: &[rustc_span::Symbol]| items.iter().any(|s| cx.tcx.is_diagnostic_item(*s, did));
+    let mut mutable = None;
+    let found = find_owned(cx, ty, &mut |t| match t.kind() {
+        ty::Adt(def, _) if is(def.did(), &[sym::RcWeak, sym::ArcWeak]) => Step::Found,
+        ty::Adt(def, args) if is(def.did(), &[sym::Rc, sym::Arc]) => match mutable_inside(cx, args.type_at(0)) {
+            Some(m) => {
+                mutable = Some(m);
+                Step::Found
+            }
+            None => Step::Descend,
+        },
         _ => Step::Descend,
+    })?;
+    let what = if found == ty { format!("`{ty}`") } else { format!("`{ty}` holds `{found}`, which") };
+    Some(match mutable {
+        Some(m) => format!("{what} is shared and mutable through `{m}`; a stored copy would no longer be shared"),
+        None => format!("{what} is a `Weak`; a stored one comes back empty"),
     })
 }
 
@@ -195,22 +214,21 @@ impl<'a, 'tcx> Planner<'a, 'tcx> {
                 ));
             }
         }
-        if let Some(t) = shared_pointer(self.cx, ty) {
-            return Err(format!("`{ty}` holds a shared pointer (`{t}`); a stored copy would no longer be shared"));
-        }
         if self.serde.is_none() {
             return Err("serde is not in the crate graph".into());
         }
-        if let ty::Array(elem, len) = ty.kind()
-            && let Some(n) = len.try_to_target_usize(self.cx.tcx)
-            && self.is_serde(*elem)
-        {
-            return Ok(Kind::Array(path(*elem), n));
+        let kind = match ty.kind() {
+            ty::Array(elem, len) if self.is_serde(*elem) && len.try_to_target_usize(self.cx.tcx).is_some() => {
+                Kind::Array(path(*elem), len.try_to_target_usize(self.cx.tcx).unwrap())
+            }
+            _ if self.is_serde(ty) => Kind::Serde(path(ty)),
+            _ => return Err(format!("`{ty}` does not implement Serialize + DeserializeOwned")),
+        };
+        // After serde: a type without serde impls gets that error instead.
+        match lost_identity(self.cx, ty) {
+            Some(why) => Err(why),
+            None => Ok(kind),
         }
-        if !self.is_serde(ty) {
-            return Err(format!("`{ty}` does not implement Serialize + DeserializeOwned"));
-        }
-        Ok(Kind::Serde(path(ty)))
     }
 
     /// Values stored in a coroutine state; None for the poisoned state.
