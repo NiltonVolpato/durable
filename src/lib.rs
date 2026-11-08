@@ -1,5 +1,5 @@
 #![feature(auto_traits, negative_impls)]
-//! PoC of durable native futures. See docs/design.md.
+//! PoC of durable native futures. See docs/README.md.
 
 use std::future::Future;
 use std::hash::Hasher;

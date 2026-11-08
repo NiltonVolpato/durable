@@ -1,0 +1,88 @@
+# Status
+
+What each PoC step showed, how to run it, and what is left for an alpha ([overview](README.md)).
+
+## Layout
+
+| Path | What |
+|---|---|
+| `src/lib.rs` | `Durable`, leaves (`Slow`, `SleepUntil`), `Ephemeral`, `Join2`, `Select2`, `Structural`, raw-copy `run` |
+| `src/arena.rs` | `Task` (arena + header), `ABox`, `DVec`, `RelRef` |
+| `src/glue.rs` | Serialized-frame runtime (`serialize`, `deserialize`, helpers for generated code) |
+| `src/main.rs` | `poc` binary: raw copy (`start`/`resume`) and serialized (`sstart`/`sresume`) |
+| `src/compile_checks.rs` | Doctests for the `Durable` auto trait |
+| `driver/` | `durable-driver`: frame collection, glue, lint, drop flags |
+| `steps/`, `probe/` | SDK crate and the tokio probe |
+| `tests/roundtrip.rs` | Raw-copy round trips (Miri) |
+| `tests/serde_roundtrip.rs` | Serialized round trips (native + Miri, via `driver/serde-test.sh`) |
+| `examples/lint_fail.rs` | Workflows the lint must reject |
+
+## How to run
+
+```
+cargo test                                  # doctests + raw-copy round trip
+./demo.sh                                   # multi-process demo, both paths
+./build-glue.sh [pkg crate main]            # two-pass build with serde glue
+probe/run.sh 7                              # realistic tokio workflow, 6 parks
+driver/lint-check.sh                        # the lint rejects examples/lint_fail.rs
+driver/evolve-demo.sh                       # old snapshot into a changed build
+driver/serde-test.sh                        # serialized round trips, native + Miri
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --test roundtrip
+```
+
+Run the binaries from `build-glue.sh` directly. A plain `cargo build` afterwards rebuilds them with an empty glue table.
+
+## Steps
+
+### v0
+
+Raw copy of a native `async fn`: frame in a `Box`, hand-written poll loop with `Waker::noop()`, snapshot checked against a hash of the executable.
+
+- `poc start classify 7` → park → `resume` → park on the nested fn's slow call → `resume` → 49. Three processes, frame at a different address each time.
+- User auto traits propagate through `async fn` exactly like `Send`, with the same diagnostics.
+- Compile checks: borrows, `String`, `&'static str` and hidden temporaries across a slow await are rejected. Dead borrows and nested async fns are accepted.
+- Negative controls: forcing a frame borrow past the check gives a segfault, bus error or wrong answer on resume. `join(slow, ephemeral)` led to the eviction-time check.
+
+### v1
+
+- Fixed-size task arena (64 KiB): header, root frame, task data. Eviction copies the used prefix (264 B for `classify`, 640–1152 B for `triage`).
+- `ABox`, `DVec` (grows iff `T: Unpin`) and `RelRef`. `triage` holds all three across two slow awaits and finishes in a third process (574).
+- Per-task state (ephemeral counter, parked flag) moved into the arena header.
+- Negative impls for OS handles and `Instant`.
+- Raw-copy round trips pass under Miri.
+
+### Serialized frames
+
+- `durable-driver` dumps coroutine layouts; a snapshot decoded with only the dump matched.
+- Two-pass serde glue: `profile` holds a `Vec<String>` and a `String` across two slow calls and finishes in a third process (60).
+- Compile-time lint at slow awaits (6 rejected cases).
+- Versioned snapshots: a v1 snapshot finishes in a v2 that added a step; a v3 that changed the parked state refuses it.
+- Miri: no UB and no leaks with uninitialized non-live bytes; the negative control is caught.
+
+### Tokio probe
+
+- One realistic workflow on tokio with real I/O, an SDK crate, a join, a select against a durable timer, a generic helper with a closure, and a drop flag.
+- The driver now follows frames across crates and generics, with combinators, closures and drop flags.
+- `probe/run.sh 7` → 65, `probe/run.sh 8` → 66.
+
+See [serialized frames](serialized-frames.md#realistic-probe-on-tokio).
+
+## Road to an alpha
+
+Estimate after the probe: most of the risky unknowns are resolved, but only about a quarter to a third of the work for an alpha that others can use is done. What remains is mostly known engineering, plus a long tail of language cases of unknown size.
+
+| Area | Missing | Size |
+|---|---|---|
+| Runtime | Store, message queue, outbox, wake-ups, recovery, multi-threaded tokio ([v2 plan](runtime.md#v2-plan)) | Large, mostly known |
+| Build tooling | `cargo durable build` instead of two passes; pinned nightly; CI | Medium |
+| Deploys | Stable await keys; old builds draining their tasks | Medium, some design open |
+| Coverage | `dyn` futures, enums holding frames, tokio combinators, private types in other modules, async closures, async fns in traits, `Arc` state | Unknown: the long tail |
+| Robustness | Panics, leaks on failed resume, `step(f)`, cancellation, more Miri coverage | Medium |
+| Usability | Docs, messages, inspecting parked tasks | Small to medium |
+
+Risks:
+
+- **Long tail.** One realistic workflow surfaced six special cases. Porting one or two real workflows from an existing codebase would measure how many more remain.
+- **rustc internals.** Every nightly update can break the driver. Long term, compiler support upstream (reading coroutine layouts, or a derive for coroutines) would remove this.
+
+Open decision: drop the raw-copy path (arena, `Durable`, `RelRef`, `Ephemeral`) for the alpha. Serialized frames does what it does with fewer restrictions.
