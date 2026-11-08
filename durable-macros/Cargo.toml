@@ -1,0 +1,8 @@
+[package]
+name = "durable-macros"
+version = "0.1.0"
+edition = "2024"
+description = "Macros for the durable crate."
+
+[lib]
+proc-macro = true

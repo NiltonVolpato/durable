@@ -1,7 +1,7 @@
 //! Compile-time check: at every slow await reachable from a workflow root,
 //! every live value must be serializable by the glue.
 //!
-//! A frame can park if it awaits a type implementing `durable_poc::SlowLeaf`,
+//! A frame can park if it awaits a type implementing `durable::SlowLeaf`,
 //! or another frame that can park (a coroutine, or a `Structural` combinator
 //! with such a field). Computed as a fixpoint over the collected frames.
 //! A wrapper the driver cannot see into counts as slow if one of its generic
@@ -54,7 +54,7 @@ impl<'tcx> Slow<'_, 'tcx> {
 /// Emit an error for each slow await that holds something unserializable.
 /// Returns the number of errors.
 pub fn check<'tcx>(cx: &Ctx<'tcx>, frames: &[Frame<'tcx>], planner: &Planner<'_, 'tcx>) -> usize {
-    let Some(leaf) = glue::find_trait(cx.tcx, &["durable_poc"], "SlowLeaf") else { return 0 };
+    let Some(leaf) = glue::find_trait(cx.tcx, &[cx.rt], "SlowLeaf") else { return 0 };
     let mut s = Slow { cx, planner, leaf, slow: vec![false; frames.len()] };
     loop {
         let mut changed = false;

@@ -4,7 +4,7 @@
 //! (comma-separated) are processed. Roots are `async fn`s marked
 //! `#[durable::workflow]`; from them the driver follows every frame they can
 //! hold: coroutines (generic or from other crates, with concrete arguments),
-//! closures, and structs implementing `durable_poc::Structural`.
+//! closures, and structs implementing `durable::Structural`.
 //!
 //! Outputs (each optional):
 //! - `DURABLE_DUMP=path`: human-readable dump of the frames.
@@ -32,7 +32,7 @@ use rustc_abi::Variants;
 use rustc_driver::{Callbacks, Compilation};
 use rustc_interface::interface::Compiler;
 use rustc_middle::ty::{self, EarlyBinder, Ty, TyCtxt, TypeVisitableExt};
-use rustc_span::def_id::LOCAL_CRATE;
+use rustc_span::def_id::{DefId, LOCAL_CRATE};
 use rustc_span::{Span, Symbol};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -82,6 +82,8 @@ pub struct Frame<'tcx> {
 
 pub struct Ctx<'tcx> {
     pub tcx: TyCtxt<'tcx>,
+    /// The runtime crate in the crate graph: `durable`, or the PoC's `durable_poc`.
+    pub rt: &'static str,
     structural: Option<rustc_span::def_id::DefId>,
 }
 
@@ -213,18 +215,59 @@ impl<'tcx> Frame<'tcx> {
     }
 }
 
-fn is_workflow(tcx: TyCtxt<'_>, def_id: rustc_span::def_id::DefId) -> bool {
+/// Functions marked by `#[durable::workflow]`: the macro emits
+/// `const _: () = { let _ = ::durable::__private::Root(name); };`.
+fn marked_roots(tcx: TyCtxt<'_>) -> HashSet<DefId> {
+    use rustc_hir::def::{DefKind, Res};
+    use rustc_hir::intravisit::{self, Visitor};
+    use rustc_hir::{Expr, ExprKind, QPath};
+    struct Find<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        out: HashSet<DefId>,
+    }
+    impl<'tcx> Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if let ExprKind::Call(callee, [arg]) = e.kind
+                && let ExprKind::Path(QPath::Resolved(_, p)) = callee.kind
+                && let Res::Def(DefKind::Ctor(..), ctor) = p.res
+                && self.tcx.def_path_str(ctor).ends_with("__private::Root")
+                && let ExprKind::Path(QPath::Resolved(_, ap)) = arg.kind
+                && let Res::Def(DefKind::Fn, f) = ap.res
+            {
+                self.out.insert(f);
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut find = Find { tcx, out: HashSet::new() };
+    for owner in tcx.hir_body_owners() {
+        if tcx.def_kind(owner) == rustc_hir::def::DefKind::Const {
+            find.visit_expr(tcx.hir_body_owned_by(owner).value);
+        }
+    }
+    find.out
+}
+
+/// A root: marked by `#[durable::workflow]`, or (PoC) by the tool attribute.
+fn is_workflow(tcx: TyCtxt<'_>, marked: &HashSet<DefId>, def_id: DefId) -> bool {
+    let root = tcx.typeck_root_def_id(def_id);
     let path = [Symbol::intern("durable"), Symbol::intern("workflow")];
-    tcx.tool_attrs(tcx.typeck_root_def_id(def_id), &path).next().is_some()
+    marked.contains(&root) || tcx.tool_attrs(root, &path).next().is_some()
 }
 
 /// Workflow roots, then every frame reachable from them.
 fn collect<'tcx>(cx: &Ctx<'tcx>) -> Vec<Frame<'tcx>> {
     let tcx = cx.tcx;
+    let marked = marked_roots(tcx);
+    for f in &marked {
+        if tcx.generics_of(*f).count() > 0 {
+            tcx.dcx().span_err(tcx.def_span(*f), "durable workflows cannot be generic (alpha); wrap the generic code in a concrete workflow");
+        }
+    }
     let mut queue = VecDeque::new();
     for def_id in tcx.hir_body_owners() {
         let def_id = def_id.to_def_id();
-        if tcx.is_coroutine(def_id) && is_fn_body(tcx, def_id) && is_workflow(tcx, def_id) {
+        if tcx.is_coroutine(def_id) && is_fn_body(tcx, def_id) && is_workflow(tcx, &marked, def_id) {
             let ty = tcx.type_of(def_id).instantiate_identity().skip_normalization();
             if !ty.has_param() {
                 queue.push_back((ty, true));
@@ -291,11 +334,18 @@ struct Driver;
 impl Callbacks for Driver {
     fn after_analysis<'tcx>(&mut self, _: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         let krate = tcx.crate_name(LOCAL_CRATE).to_string();
-        let wanted = std::env::var("DURABLE_CRATES").unwrap_or_default();
-        if !wanted.split(',').any(|c| c == krate) {
+        if let Ok(wanted) = std::env::var("DURABLE_CRATES")
+            && !wanted.split(',').any(|c| c == krate)
+        {
             return Compilation::Continue;
         }
-        let cx = Ctx { tcx, structural: glue::find_trait(tcx, &["durable_poc"], "Structural") };
+        // The runtime crate this crate uses, if any.
+        let rt = ["durable", "durable_poc"]
+            .into_iter()
+            .find(|c| glue::find_trait(tcx, &[c], "SlowLeaf").is_some());
+        let Some(rt) = rt else { return Compilation::Continue };
+        glue::set_runtime(rt);
+        let cx = Ctx { tcx, rt, structural: glue::find_trait(tcx, &[rt], "Structural") };
         let frames = collect(&cx);
         if frames.is_empty() {
             return Compilation::Continue; // e.g. the lib target of a lib+bin package
@@ -304,12 +354,28 @@ impl Callbacks for Driver {
             std::fs::write(path, dump(&frames)).unwrap();
         }
         let planner = glue::Planner::new(&cx, &frames);
-        if lint::check(&cx, &frames, &planner) > 0 {
+        if lint::check(&cx, &frames, &planner) > 0 || tcx.dcx().has_errors().is_some() {
             return Compilation::Stop;
         }
         let code = glue::generate(&frames, &planner);
         if let Ok(path) = std::env::var("DURABLE_GLUE_OUT") {
             std::fs::write(path, &code).unwrap();
+        }
+        // cargo durable: pass 1 writes `<dir>/<crate>.rs`; pass 2 (which
+        // included it via `durable::glue!()`) checks it, and rewrites it if stale.
+        if let Ok(dir) = std::env::var("DURABLE_GLUE_DIR") {
+            let path = format!("{dir}/{krate}.rs");
+            let pass2 = std::env::var("DURABLE_PASS").as_deref() == Ok("2");
+            let included = std::fs::read_to_string(&path).unwrap_or_default();
+            if included != code {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(&path, &code).unwrap();
+                if pass2 {
+                    tcx.dcx().fatal(format!(
+                        "durable glue for `{krate}` was out of date and has been regenerated; build again"
+                    ));
+                }
+            }
         }
         if let Ok(path) = std::env::var("DURABLE_GLUE_CHECK") {
             let included = std::fs::read_to_string(&path).unwrap_or_default();

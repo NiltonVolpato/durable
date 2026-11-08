@@ -18,7 +18,16 @@ use rustc_trait_selection::infer::InferCtxtExt;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-const RT: &str = "::durable_poc::glue";
+static RT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Name the runtime crate the generated code calls into (`durable` or `durable_poc`).
+pub fn set_runtime(krate: &str) {
+    let _ = RT.set(format!("::{krate}::glue"));
+}
+
+fn rt() -> &'static str {
+    RT.get().map(String::as_str).unwrap_or("::durable::glue")
+}
 
 /// Why a value of this type cannot go through serde, if it cannot.
 fn unsupported(ty: Ty<'_>) -> Option<String> {
@@ -194,23 +203,24 @@ fn signature<'tcx>(plan: &Plan<'_, 'tcx>) -> String {
 
 /// Statements that put / take each value of a plan (`m` is the map, `v` the value).
 fn put_take<'tcx>(plan: &Plan<'_, 'tcx>, ser: &mut String, de: &mut String, indent: &str) {
+    let rt = rt();
     for (f, k) in plan {
         let (n, o) = (&f.name, f.offset);
         let (put, take) = match k {
-            Kind::Nested(j) => (format!("__ser_{j}(p.add({o}))?"), format!("__de_{j}({RT}::field(v, {n:?})?, p.add({o}))?")),
+            Kind::Nested(j) => (format!("__ser_{j}(p.add({o}))?"), format!("__de_{j}({rt}::field(v, {n:?})?, p.add({o}))?")),
             Kind::Array(t, len) => (
-                format!("{RT}::ser_array::<{t}, {len}>(p.add({o}))?"),
-                format!("{RT}::de_array::<{t}, {len}>(v, {n:?}, p.add({o}))?"),
+                format!("{rt}::ser_array::<{t}, {len}>(p.add({o}))?"),
+                format!("{rt}::de_array::<{t}, {len}>(v, {n:?}, p.add({o}))?"),
             ),
             Kind::Serde(t) => {
-                (format!("{RT}::ser_field::<{t}>(p.add({o}))?"), format!("{RT}::de_field::<{t}>(v, {n:?}, p.add({o}))?"))
+                (format!("{rt}::ser_field::<{t}>(p.add({o}))?"), format!("{rt}::de_field::<{t}>(v, {n:?}, p.add({o}))?"))
             }
         };
         match f.flag {
             // Drop-flag guarded: present only while initialized.
             Some(fo) => {
                 let _ = writeln!(ser, "{indent}if ::core::ptr::read(p.add({fo}) as *const bool) {{ m.insert({n:?}.into(), {put}); }}");
-                let _ = writeln!(de, "{indent}if {RT}::field(v, {:?})?.as_bool() == Some(true) {{ {take}; }}", format!("{n}.init"));
+                let _ = writeln!(de, "{indent}if {rt}::field(v, {:?})?.as_bool() == Some(true) {{ {take}; }}", format!("{n}.init"));
             }
             None => {
                 let _ = writeln!(ser, "{indent}m.insert({n:?}.into(), {put});");
@@ -223,10 +233,11 @@ fn put_take<'tcx>(plan: &Plan<'_, 'tcx>, ser: &mut String, de: &mut String, inde
 const ALLOW: &str = "#[allow(unused_mut, unused_unsafe, unused_variables, unreachable_code)]";
 
 fn coroutine_glue<'tcx>(i: usize, fr: &Frame<'tcx>, planner: &Planner<'_, 'tcx>, s: &mut String) {
+    let rt = rt();
     let name = fr.ty.to_string();
     let Shape::Coroutine { tag: Some((tsize, toff)), states, .. } = &fr.shape else {
-        let _ = writeln!(s, "unsafe fn __ser_{i}(_: *const u8) -> {RT}::Result<{RT}::Value> {{ Err({:?}.into()) }}", format!("{name}: no tag"));
-        let _ = writeln!(s, "unsafe fn __de_{i}(_: &{RT}::Value, _: *mut u8) -> {RT}::Result<()> {{ Err({:?}.into()) }}\n", format!("{name}: no tag"));
+        let _ = writeln!(s, "unsafe fn __ser_{i}(_: *const u8) -> {rt}::Result<{rt}::Value> {{ Err({:?}.into()) }}", format!("{name}: no tag"));
+        let _ = writeln!(s, "unsafe fn __de_{i}(_: &{rt}::Value, _: *mut u8) -> {rt}::Result<()> {{ Err({:?}.into()) }}\n", format!("{name}: no tag"));
         return;
     };
     let (mut ser, mut de) = (String::new(), String::new());
@@ -242,47 +253,49 @@ fn coroutine_glue<'tcx>(i: usize, fr: &Frame<'tcx>, planner: &Planner<'_, 'tcx>,
             }
         };
         let sig = signature(&plan);
-        let _ = writeln!(ser, "        {} => {{\n            let mut m = {RT}::Map::new();", st.index);
+        let _ = writeln!(ser, "        {} => {{\n            let mut m = {rt}::Map::new();", st.index);
         let _ = writeln!(ser, "            m.insert(\"state\".into(), {}u64.into());", st.index);
         let _ = writeln!(ser, "            m.insert(\"sig\".into(), {sig:?}.into());");
         let _ = writeln!(ser, "            m.insert(\"at\".into(), {:?}.into());", st.at);
-        let _ = writeln!(de, "        {} => {{\n            {RT}::check_sig(v, {sig:?})?;", st.index);
+        let _ = writeln!(de, "        {} => {{\n            {rt}::check_sig(v, {sig:?})?;", st.index);
         put_take(&plan, &mut ser, &mut de, "            ");
         let _ = writeln!(ser, "            Ok(m.into())\n        }}");
         let _ = writeln!(de, "            ::core::ptr::write(p.add({toff}) as *mut {}, {});\n            Ok(())\n        }}", uint(*tsize), st.index);
     }
     let _ = writeln!(s, "// {name}\n{ALLOW}");
-    let _ = writeln!(s, "unsafe fn __ser_{i}(p: *const u8) -> {RT}::Result<{RT}::Value> {{ unsafe {{");
+    let _ = writeln!(s, "unsafe fn __ser_{i}(p: *const u8) -> {rt}::Result<{rt}::Value> {{ unsafe {{");
     let _ = writeln!(s, "    match ::core::ptr::read(p.add({toff}) as *const {}) {{", uint(*tsize));
     s.push_str(&ser);
     let _ = writeln!(s, "        t => Err(format!(\"{{}}: state {{}} cannot be serialized\", {name:?}, t)),\n    }}\n}}}}");
-    let _ = writeln!(s, "{ALLOW}\nunsafe fn __de_{i}(v: &{RT}::Value, p: *mut u8) -> {RT}::Result<()> {{ unsafe {{");
-    let _ = writeln!(s, "    match {RT}::state(v)? {{");
+    let _ = writeln!(s, "{ALLOW}\nunsafe fn __de_{i}(v: &{rt}::Value, p: *mut u8) -> {rt}::Result<()> {{ unsafe {{");
+    let _ = writeln!(s, "    match {rt}::state(v)? {{");
     s.push_str(&de);
     let _ = writeln!(s, "        t => Err(format!(\"{{}}: state {{}} cannot be deserialized\", {name:?}, t)),\n    }}\n}}}}\n");
 }
 
 fn fields_glue<'tcx>(i: usize, fr: &Frame<'tcx>, planner: &Planner<'_, 'tcx>, s: &mut String) {
+    let rt = rt();
     let Shape::Fields(fields) = &fr.shape else { return };
     let name = fr.ty.to_string();
     let _ = writeln!(s, "// {name}\n{ALLOW}");
     match planner.plan(fields.iter().collect()) {
         Err((f, why)) => {
             let msg = format!("{name}: {}: {why}", f.name);
-            let _ = writeln!(s, "unsafe fn __ser_{i}(_: *const u8) -> {RT}::Result<{RT}::Value> {{ Err({msg:?}.into()) }}\n{ALLOW}");
-            let _ = writeln!(s, "unsafe fn __de_{i}(_: &{RT}::Value, _: *mut u8) -> {RT}::Result<()> {{ Err({msg:?}.into()) }}\n");
+            let _ = writeln!(s, "unsafe fn __ser_{i}(_: *const u8) -> {rt}::Result<{rt}::Value> {{ Err({msg:?}.into()) }}\n{ALLOW}");
+            let _ = writeln!(s, "unsafe fn __de_{i}(_: &{rt}::Value, _: *mut u8) -> {rt}::Result<()> {{ Err({msg:?}.into()) }}\n");
         }
         Ok(plan) => {
             let (mut ser, mut de) = (String::new(), String::new());
             put_take(&plan, &mut ser, &mut de, "    ");
-            let _ = writeln!(s, "unsafe fn __ser_{i}(p: *const u8) -> {RT}::Result<{RT}::Value> {{ unsafe {{\n    let mut m = {RT}::Map::new();");
+            let _ = writeln!(s, "unsafe fn __ser_{i}(p: *const u8) -> {rt}::Result<{rt}::Value> {{ unsafe {{\n    let mut m = {rt}::Map::new();");
             let _ = writeln!(s, "{ser}    Ok(m.into())\n}}}}\n{ALLOW}");
-            let _ = writeln!(s, "unsafe fn __de_{i}(v: &{RT}::Value, p: *mut u8) -> {RT}::Result<()> {{ unsafe {{\n{de}    Ok(())\n}}}}\n");
+            let _ = writeln!(s, "unsafe fn __de_{i}(v: &{rt}::Value, p: *mut u8) -> {rt}::Result<()> {{ unsafe {{\n{de}    Ok(())\n}}}}\n");
         }
     }
 }
 
 pub fn generate<'tcx>(frames: &[Frame<'tcx>], planner: &Planner<'_, 'tcx>) -> String {
+    let rt = rt();
     let mut s = String::from("// @generated by durable-driver from this crate's workflow frames. Do not edit.\n\n");
     for (i, fr) in frames.iter().enumerate() {
         match fr.shape {
@@ -290,11 +303,11 @@ pub fn generate<'tcx>(frames: &[Frame<'tcx>], planner: &Planner<'_, 'tcx>) -> St
             Shape::Fields(_) => fields_glue(i, fr, planner, &mut s),
         }
     }
-    let _ = writeln!(s, "pub static GLUE: &[{RT}::Entry] = &[");
+    let _ = writeln!(s, "pub static GLUE: &[{rt}::Entry] = &[");
     for (i, fr) in frames.iter().enumerate().filter(|(_, f)| f.root) {
         let _ = writeln!(
             s,
-            "    {RT}::Entry {{ type_name: {:?}, size: {}, align: {}, ser: __ser_{i}, de: __de_{i} }},",
+            "    {rt}::Entry {{ type_name: {:?}, size: {}, align: {}, ser: __ser_{i}, de: __de_{i} }},",
             fr.type_name, fr.size, fr.align
         );
     }
