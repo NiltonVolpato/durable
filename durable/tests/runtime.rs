@@ -51,7 +51,8 @@ async fn two_steps(x: u64) -> u64 {
 }
 
 thread_local! {
-    static RELEASED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    /// (lease id, `is_parking()`) for each drop.
+    static RELEASED: RefCell<Vec<(u64, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A value whose destructor has a side effect. Without the opt-in,
@@ -63,7 +64,7 @@ pub struct Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        RELEASED.with(|r| r.borrow_mut().push(self.id));
+        RELEASED.with(|r| r.borrow_mut().push((self.id, durable::is_parking())));
     }
 }
 
@@ -223,15 +224,20 @@ async fn handlers_run_in_process_and_retry() {
     assert_eq!(*calls.borrow(), 3);
 }
 
-/// What `DropOnPark` accepts: the destructor runs when the task parks, and
-/// again on the rebuilt copy.
+/// What `DropOnPark` accepts: the destructor runs when the task parks, with
+/// `is_parking()` true, and again on the rebuilt copy at the real end.
 #[tokio::test]
-async fn opted_in_destructor_runs_at_park_and_at_end() {
+async fn opted_in_destructor_sees_parking() {
     let path = db("lease");
     let (rt, _) = runtime(&path);
-    RELEASED.with(|r| r.borrow_mut().clear());
+    let released = || RELEASED.with(|r| r.borrow_mut().drain(..).collect::<Vec<_>>());
+    released();
     assert!(matches!(rt.start("t", leased(7)).await.unwrap(), Outcome::Parked));
-    assert_eq!(RELEASED.with(|r| r.borrow().clone()), vec![7]);
+    assert_eq!(released(), vec![(7, true)]);
+    // Refused at store: the task never existed, so that drop is a real end.
+    assert!(matches!(rt.start("t", leased(9)).await, Err(Error::TaskExists(_))));
+    assert_eq!(released(), vec![(9, false)]);
     assert_eq!(rt.deliver("t", 0, 1u64).await.unwrap(), Status::Done(serde_json::json!(8)));
-    assert_eq!(RELEASED.with(|r| r.borrow().clone()), vec![7, 7]);
+    assert_eq!(released(), vec![(7, false)]);
+    assert!(!durable::is_parking());
 }

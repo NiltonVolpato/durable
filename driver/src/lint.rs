@@ -16,11 +16,10 @@
 //! `durable::DropOnPark`. std types are trusted (their destructors only free
 //! memory), but their type arguments are checked.
 
-use crate::glue::{self, Kind, Planner};
+use crate::glue::{self, Kind, Planner, Step};
 use crate::{Ctx, Field, Frame, Shape, State};
 use rustc_middle::ty::{self, Ty, TypeVisitableExt};
 use rustc_span::def_id::DefId;
-use std::collections::HashSet;
 
 fn awaitee<'a, 'tcx>(st: &'a State<'tcx>) -> Option<&'a Field<'tcx>> {
     st.fields.iter().find(|f| f.name == "__awaitee")
@@ -78,27 +77,14 @@ impl<'tcx> Drops<'_, 'tcx> {
     }
 
     /// The first type in `ty` with a user `Drop` impl and no opt-in.
-    fn in_type(&self, ty: Ty<'tcx>, seen: &mut HashSet<Ty<'tcx>>) -> Option<Ty<'tcx>> {
+    fn in_type(&self, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
         let tcx = self.cx.tcx;
-        if !seen.insert(ty) || !ty.needs_drop(tcx, ty::TypingEnv::fully_monomorphized()) {
-            return None;
-        }
-        match ty.kind() {
-            ty::Adt(def, _) if def.is_manually_drop() || def.is_phantom_data() => None,
-            ty::Adt(..) if self.opted_in(ty) => None,
-            ty::Adt(def, args) => {
-                if matches!(tcx.crate_name(def.did().krate).as_str(), "std" | "core" | "alloc") {
-                    return args.types().find_map(|t| self.in_type(t, seen));
-                }
-                if tcx.adt_destructor(def.did()).is_some() {
-                    return Some(ty);
-                }
-                def.all_fields().find_map(|f| self.in_type(self.cx.normalize(f.ty(tcx, *args)), seen))
-            }
-            ty::Tuple(ts) => ts.iter().find_map(|t| self.in_type(t, seen)),
-            ty::Array(t, _) | ty::Slice(t) => self.in_type(*t, seen),
-            _ => None,
-        }
+        glue::find_owned(self.cx, ty, &mut |t| match t.kind() {
+            _ if !t.needs_drop(tcx, ty::TypingEnv::fully_monomorphized()) => Step::Skip,
+            ty::Adt(def, _) if def.is_manually_drop() || self.opted_in(t) => Step::Skip,
+            ty::Adt(def, _) if !glue::is_std(tcx, def.did()) && tcx.adt_destructor(def.did()).is_some() => Step::Found,
+            _ => Step::Descend,
+        })
     }
 
     /// The first value (by path) under `f` with a user `Drop` impl and no opt-in.
@@ -106,7 +92,7 @@ impl<'tcx> Drops<'_, 'tcx> {
     /// own slow states; one that was not holds only its upvars.
     fn in_value(&self, f: &Field<'tcx>, polled: bool, depth: usize) -> Option<(String, Ty<'tcx>)> {
         let Some(j) = self.planner.id(f.ty) else {
-            return self.in_type(f.ty, &mut HashSet::new()).map(|t| (f.name.clone(), t));
+            return self.in_type(f.ty).map(|t| (f.name.clone(), t));
         };
         if depth > 16 {
             return None;

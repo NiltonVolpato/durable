@@ -12,7 +12,7 @@
 //! Single-threaded: use a current-thread tokio runtime (or a `LocalSet`).
 
 use crate::glue::{self, Entry};
-use crate::task::{TaskCtx, enter};
+use crate::task::{TaskCtx, drop_parked, enter};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -307,8 +307,10 @@ impl Runtime {
             Step::Panicked(m) => Err(Error::Panicked(m)),
             Step::Parked => {
                 let frame = glue::serialize(entry, &fut).map_err(Error::NotSerializable)?;
-                drop(fut);
-                self.store_parked(task_id, Some(entry.type_name), &frame, &ctx)?;
+                // Not stored (e.g. `TaskExists`): the task ends here, a normal drop.
+                let stored = self.store_parked(task_id, Some(entry.type_name), &frame, &ctx);
+                if stored.is_ok() { drop_parked(fut) } else { drop(fut) }
+                stored?;
                 self.dispatch_task(task_id)?;
                 Ok(Outcome::Parked)
             }
@@ -502,8 +504,9 @@ impl Runtime {
             }
             Step::Parked => match task.serialize() {
                 Ok(frame) => {
-                    drop(task);
-                    self.store_parked(task_id, None, &frame, &ctx)?;
+                    let stored = self.store_parked(task_id, None, &frame, &ctx);
+                    if stored.is_ok() { drop_parked(task) } else { drop(task) }
+                    stored?;
                     self.dispatch_task(task_id)?;
                     self.status(task_id)
                 }

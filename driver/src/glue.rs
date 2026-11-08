@@ -15,7 +15,7 @@ use rustc_middle::ty::print::{with_crate_prefix, with_no_trimmed_paths};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::def_id::DefId;
 use rustc_trait_selection::infer::InferCtxtExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 static RT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -51,6 +51,63 @@ fn unsupported(ty: Ty<'_>) -> Option<String> {
         return Some(format!("`{ty}` {why}"));
     }
     None
+}
+
+/// std, core and alloc: their destructors only free memory.
+pub fn is_std(tcx: TyCtxt<'_>, did: DefId) -> bool {
+    matches!(tcx.crate_name(did.krate).as_str(), "std" | "core" | "alloc")
+}
+
+pub enum Step {
+    Found,
+    Skip,
+    Descend,
+}
+
+/// Walk the types a value of `ty` owns: tuple and array elements, the type
+/// arguments of std types, the fields of other ADTs (`PhantomData` owns
+/// nothing). Returns the first type `visit` reports as `Found`.
+pub fn find_owned<'tcx>(cx: &Ctx<'tcx>, ty: Ty<'tcx>, visit: &mut impl FnMut(Ty<'tcx>) -> Step) -> Option<Ty<'tcx>> {
+    fn go<'tcx>(
+        cx: &Ctx<'tcx>,
+        ty: Ty<'tcx>,
+        visit: &mut impl FnMut(Ty<'tcx>) -> Step,
+        seen: &mut HashSet<Ty<'tcx>>,
+    ) -> Option<Ty<'tcx>> {
+        if !seen.insert(ty) {
+            return None;
+        }
+        match visit(ty) {
+            Step::Found => return Some(ty),
+            Step::Skip => return None,
+            Step::Descend => {}
+        }
+        match ty.kind() {
+            ty::Adt(def, _) if def.is_phantom_data() => None,
+            ty::Adt(def, args) if is_std(cx.tcx, def.did()) => args.types().find_map(|t| go(cx, t, visit, seen)),
+            ty::Adt(def, args) => {
+                def.all_fields().find_map(|f| go(cx, cx.normalize(f.ty(cx.tcx, *args)), visit, seen))
+            }
+            ty::Tuple(ts) => ts.iter().find_map(|t| go(cx, t, visit, seen)),
+            ty::Array(t, _) | ty::Slice(t) => go(cx, *t, visit, seen),
+            _ => None,
+        }
+    }
+    go(cx, ty, visit, &mut HashSet::new())
+}
+
+/// `Rc`, `Arc` or a `Weak`: with serde's `rc` feature they serialize, but
+/// each resume gets a private copy, so other holders no longer share it.
+fn shared_pointer<'tcx>(cx: &Ctx<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+    use rustc_span::sym;
+    find_owned(cx, ty, &mut |t| match t.kind() {
+        ty::Adt(def, _)
+            if [sym::Rc, sym::Arc, sym::RcWeak, sym::ArcWeak].iter().any(|s| cx.tcx.is_diagnostic_item(*s, def.did())) =>
+        {
+            Step::Found
+        }
+        _ => Step::Descend,
+    })
 }
 
 fn path(ty: Ty<'_>) -> String {
@@ -137,6 +194,9 @@ impl<'a, 'tcx> Planner<'a, 'tcx> {
                     tcx.def_path_str(def.did())
                 ));
             }
+        }
+        if let Some(t) = shared_pointer(self.cx, ty) {
+            return Err(format!("`{ty}` holds a shared pointer (`{t}`); a stored copy would no longer be shared"));
         }
         if self.serde.is_none() {
             return Err("serde is not in the crate graph".into());

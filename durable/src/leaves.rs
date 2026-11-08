@@ -16,8 +16,9 @@ pub trait SlowLeaf {}
 /// Opt-in for a type with a `Drop` impl (or a field with one) to be live at a
 /// slow await. Parking drops the in-memory frame, so the destructor runs at
 /// park, and again on the rebuilt copy when the scope really ends. Implement
-/// this only if that is harmless (memory only, idempotent, or the destructor
-/// tells the two apart). durable-driver rejects such types otherwise.
+/// this only if that is harmless: memory only, idempotent, or the destructor
+/// skips its side effect when `durable::is_parking()` is true.
+/// durable-driver rejects such types otherwise.
 pub trait DropOnPark {}
 
 /// An external call whose result is delivered later with `Runtime::deliver`.

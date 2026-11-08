@@ -7,7 +7,8 @@ description = "Code outside the alpha subset, and the errors it gets. Run check.
 
 [dependencies]
 durable = { path = "../../durable" }
-serde = { version = "1", features = ["derive"] }
+# `rc`: Arc/Rc serialize, and are still rejected at slow awaits.
+serde = { version = "1", features = ["derive", "rc"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 
 # The examples are meant not to compile; only check.sh builds them.

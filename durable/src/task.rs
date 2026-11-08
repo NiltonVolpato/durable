@@ -34,6 +34,28 @@ pub struct TaskCtx {
 thread_local! {
     /// The task being polled. Set for one poll at a time.
     static CURRENT: Cell<*mut TaskCtx> = const { Cell::new(std::ptr::null_mut()) };
+    /// Set while the runtime drops a frame it has just stored.
+    static PARKING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True while the runtime drops the in-memory frame of a task it has just
+/// stored. A destructor that runs then will run again on the resumed copy at
+/// the real end of the scope, so a `DropOnPark` type can skip its side effect.
+pub fn is_parking() -> bool {
+    PARKING.get()
+}
+
+/// Drop `frame` with `is_parking()` true.
+pub(crate) fn drop_parked<T>(frame: T) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PARKING.set(false);
+        }
+    }
+    PARKING.set(true);
+    let _reset = Reset;
+    drop(frame);
 }
 
 /// Run `f` with `ctx` as the current task.

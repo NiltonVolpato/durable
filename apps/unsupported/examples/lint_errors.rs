@@ -2,6 +2,7 @@
 //! that cannot be stored.
 
 use durable::request;
+use std::rc::Rc;
 use std::sync::Arc;
 
 mod private {
@@ -113,8 +114,21 @@ async fn unstarted_lease(id: u64) -> u64 {
     v + later.await
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Shared {
+    names: Rc<Vec<String>>,
+}
+
+/// Serializable with serde's `rc` feature, but the sharing would be lost.
+#[durable::workflow]
+async fn rc_field(id: u64) -> u64 {
+    let s = Shared { names: Rc::new(vec![]) };
+    let v: u64 = request("a", id).await;
+    v + s.names.len() as u64
+}
+
 durable::glue!();
 fn main() {
     let _ = (private::private_type(1), borrow_across(1), tokio_join(1), tokio_timeout(1), option_of_future(1), arc_state(1));
-    let _ = (lease_across(1), nested_lease(1), closure_lease(1), unstarted_lease(1));
+    let _ = (lease_across(1), nested_lease(1), closure_lease(1), unstarted_lease(1), rc_field(1));
 }
