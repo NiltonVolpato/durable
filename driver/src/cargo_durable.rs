@@ -1,5 +1,5 @@
-//! `cargo durable build|run [cargo args]`: build with durable-driver and the
-//! generated serde glue, in one command.
+//! `cargo durable build|run|test [cargo args]`: build with durable-driver and
+//! the generated serde glue, in one command.
 //!
 //! 1. Build with the existing glue (`DURABLE_PASS=2`). If it is current, done.
 //! 2. Otherwise build with empty glue (`DURABLE_PASS=1`), which writes it.
@@ -56,7 +56,7 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("durable") {
         args.remove(0); // invoked as `cargo durable ...`
     }
-    let usage = "usage: cargo durable build|run [cargo args] [-- program args]";
+    let usage = "usage: cargo durable build|run|test [cargo args] [-- program args]";
     if args.is_empty() {
         eprintln!("{usage}");
         return ExitCode::FAILURE;
@@ -70,15 +70,19 @@ fn main() -> ExitCode {
     let env = Env { driver, glue_dir: target_dir().join("durable") };
     let split = args.iter().position(|a| a == "--").unwrap_or(args.len());
     let (build_args, rest) = args.split_at(split);
-    if !env.build(build_args) {
+    let mut to_build = build_args.to_vec();
+    if cmd == "test" {
+        to_build.push("--tests".into());
+    }
+    if !env.build(&to_build) {
         return ExitCode::FAILURE;
     }
     match cmd.as_str() {
         "build" => ExitCode::SUCCESS,
-        "run" => {
+        "run" | "test" => {
             let mut run_args = build_args.to_vec();
             run_args.extend(rest.iter().cloned());
-            let ok = env.cargo("run", &run_args, "2").arg("-q").status().expect("cargo run").success();
+            let ok = env.cargo(&cmd, &run_args, "2").status().expect("cargo run").success();
             if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         _ => {

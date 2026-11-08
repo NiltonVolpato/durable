@@ -6,6 +6,10 @@ What each PoC step showed, how to run it, and what is left for an alpha ([overvi
 
 | Path | What |
 |---|---|
+| `durable/`, `durable-macros/` | The alpha: runtime on SQLite, leaves, combinators, `#[workflow]`, `glue!()` |
+| `driver/src/cargo_durable.rs` | `cargo durable build|run|test` |
+| `apps/abuse/` | Alpha example (`demo.sh`) |
+| `apps/unsupported/` | Code outside the alpha subset and its errors (`check.sh`) |
 | `src/lib.rs` | `Durable`, leaves (`Slow`, `SleepUntil`), `Ephemeral`, `Join2`, `Select2`, `Structural`, raw-copy `run` |
 | `src/arena.rs` | `Task` (arena + header), `ABox`, `DVec`, `RelRef` |
 | `src/glue.rs` | Serialized-frame runtime (`serialize`, `deserialize`, helpers for generated code) |
@@ -20,6 +24,9 @@ What each PoC step showed, how to run it, and what is left for an alpha ([overvi
 ## How to run
 
 ```
+apps/abuse/demo.sh                          # alpha: abuse classification, one process per step
+apps/unsupported/check.sh                   # alpha: every unsupported case gets its error
+target/debug/cargo-durable durable test -p durable --test runtime   # alpha runtime tests
 cargo test                                  # doctests + raw-copy round trip
 ./demo.sh                                   # multi-process demo, both paths
 ./build-glue.sh [pkg crate main]            # two-pass build with serde glue
@@ -67,14 +74,31 @@ Raw copy of a native `async fn`: frame in a `Box`, hand-written poll loop with `
 
 See [serialized frames](serialized-frames.md#realistic-probe-on-tokio).
 
+### Alpha subset
+
+- Crates `durable` (runtime, leaves `request` / `sleep_until`, `join2` / `select2`, glue runtime) and `durable-macros` (`#[workflow]`, `glue!()`).
+- Users need no `register_tool` and no build script. The macro adds a marker the driver finds, and `glue!()` includes the glue through tracked env/path.
+- `cargo durable build|run|test`: tries the current glue first, which is one compile when nothing changed. Otherwise it regenerates the glue and builds again.
+- Runtime on SQLite:
+  - the fast path stores nothing;
+  - store-then-dispatch outbox, plus `redispatch`;
+  - idempotent `deliver`;
+  - per-task lock and durable timers;
+  - requests abandoned by `select2` are cancelled;
+  - `resume` for tasks whose resume failed.
+- Errors for code outside the subset: [table](alpha.md#everything-else-and-the-error-you-get). Building `apps/unsupported` found two lint gaps, now fixed:
+  - slow leaves nested in opaque types (`Timeout<Request>`, `tokio::join!`) counted as fast;
+  - types private to a module failed inside the generated code. The lint now names them.
+- Verified: `apps/abuse/demo.sh`, `apps/unsupported/check.sh` (10 cases), `durable/tests/runtime.rs` (8 tests: fast path, restart, duplicate, deadline + cancellation, panic, hidden slow call, incompatible snapshot, redispatch, missing glue). PoC flows unchanged.
+
 ## Road to an alpha
 
-Estimate after the probe: most of the risky unknowns are resolved, but only about a quarter to a third of the work for an alpha that others can use is done. What remains is mostly known engineering, plus a long tail of language cases of unknown size.
+The alpha subset above is usable: one store, single-threaded, a subset of Rust with errors for the rest. What remains for a broader release:
 
 | Area | Missing | Size |
 |---|---|---|
-| Runtime | Store, message queue, outbox, wake-ups, recovery, multi-threaded tokio ([v2 plan](runtime.md#v2-plan)) | Large, mostly known |
-| Build tooling | `cargo durable build` instead of two passes; pinned nightly; CI | Medium |
+| Runtime | Multi-threaded tokio; other stores and queues (SQS FIFO, Postgres); cancellation notices; eviction policy ([v2 plan](runtime.md#v2-plan)) | Medium to large, mostly known |
+| Build tooling | Single-pass build; CI; release process tied to a nightly | Medium |
 | Deploys | Stable await keys; old builds draining their tasks | Medium, some design open |
 | Coverage | `dyn` futures, enums holding frames, tokio combinators, private types in other modules, async closures, async fns in traits, `Arc` state | Unknown: the long tail |
 | Robustness | Panics, leaks on failed resume, `step(f)`, cancellation, more Miri coverage | Medium |
@@ -85,4 +109,4 @@ Risks:
 - **Long tail.** One realistic workflow surfaced six special cases. Porting one or two real workflows from an existing codebase would measure how many more remain.
 - **rustc internals.** Every nightly update can break the driver. Long term, compiler support upstream (reading coroutine layouts, or a derive for coroutines) would remove this.
 
-Open decision: drop the raw-copy path (arena, `Durable`, `RelRef`, `Ephemeral`) for the alpha. Serialized frames does what it does with fewer restrictions.
+The raw-copy path (arena, `Durable`, `RelRef`, `Ephemeral`) is not part of the alpha. It stays in the PoC crate.

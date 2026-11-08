@@ -31,6 +31,13 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
     let generic = matches!(toks.get(fn_at + 2), Some(TokenTree::Punct(p)) if p.as_char() == '<')
         || matches!(toks.get(fn_at + 2), Some(TokenTree::Group(g))
             if g.stream().into_iter().any(|t| matches!(&t, TokenTree::Ident(i) if i.to_string() == "impl")));
+    let params = toks.iter().skip(fn_at + 2).find_map(|t| match t {
+        TokenTree::Group(g) if g.delimiter() == proc_macro::Delimiter::Parenthesis => Some(g.stream()),
+        _ => None,
+    });
+    if params.is_some_and(|p| p.into_iter().any(|t| matches!(&t, TokenTree::Ident(i) if i.to_string() == "self"))) {
+        return error("methods cannot be durable workflows (alpha); use a free async fn");
+    }
     if generic {
         return error("durable workflows cannot be generic (alpha); wrap the generic code in a concrete workflow");
     }

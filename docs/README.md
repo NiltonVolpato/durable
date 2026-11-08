@@ -27,10 +27,11 @@ Only the state live at a slow call has to survive. Fast sections can use borrows
 | Snapshot valid for | The exact build that wrote it | Any build where the parked state has the same locals and types |
 | Needs | Nightly (`auto_traits`, `negative_impls`) | Nightly + `rustc-dev`; a two-pass build |
 
-Serialized frames is the main path now. The raw-copy path is the original idea; it is kept for comparison and may be dropped for an alpha (see [status](status.md)).
+Serialized frames is the main path, and the [alpha](alpha.md) is built on it: crates `durable` and `durable-macros`, `cargo durable`, an SQLite runtime. The raw-copy path is the original idea; it stays in the PoC crate for comparison.
 
 ## Docs
 
+- [Alpha user guide](alpha.md): how to use `durable`, what is supported, and the error for everything else.
 - [Raw copy](raw-copy.md): the `Durable` auto trait, the task arena, `ABox`/`DVec`/`RelRef`, `Ephemeral` sections, and their holes.
 - [Serialized frames](serialized-frames.md): `durable-driver`, glue generation, the slow-await lint, snapshot versioning, Miri, and the realistic tokio probe.
 - [Runtime](runtime.md): leaves, task lifecycle, deploys and binary identity, and the v2 runtime plan.

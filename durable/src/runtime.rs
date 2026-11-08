@@ -284,6 +284,14 @@ impl Runtime {
         self.slice(task_id).await
     }
 
+    /// Run a parked task again (e.g. after a failed resume was fixed by
+    /// deploying a compatible build).
+    pub async fn resume(&self, task_id: &str) -> Result<Status, Error> {
+        let lock = self.lock(task_id);
+        let _guard = lock.lock().await;
+        self.slice(task_id).await
+    }
+
     /// Resume every parked task whose timer is due. Returns their task ids and outcomes.
     pub async fn run_due_timers(&self) -> Result<Vec<(String, Result<Status, Error>)>, Error> {
         let ids: Vec<String> = self

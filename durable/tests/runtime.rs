@@ -1,0 +1,163 @@
+//! Runtime behavior end to end. Needs the generated glue:
+//! `cargo durable test -p durable --test runtime`.
+
+use durable::{Either, Error, Outcome, Outgoing, Runtime, Status, request, select2, sleep_until};
+use std::cell::RefCell;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+
+durable::glue!();
+
+#[durable::workflow]
+async fn fast(x: u64) -> u64 {
+    x + 1
+}
+
+#[durable::workflow]
+async fn one(x: u64) -> u64 {
+    let a: u64 = request("a", x).await;
+    a + x
+}
+
+#[durable::workflow]
+async fn deadline(at_ms: u64) -> String {
+    match select2(request::<u64>("slow", ()), sleep_until(at_ms)).await {
+        Either::Left(v) => format!("got {v}"),
+        Either::Right(()) => "timeout".into(),
+    }
+}
+
+#[durable::workflow]
+async fn boom(x: u64) -> u64 {
+    let a: u64 = request("a", x).await;
+    assert!(a != 0, "zero");
+    a
+}
+
+/// The slow call is behind `dyn Future`: the lint cannot see it.
+#[durable::workflow]
+async fn hidden(x: u64) -> u64 {
+    let f: Pin<Box<dyn Future<Output = u64>>> = Box::pin(request("a", x));
+    f.await
+}
+
+type Log = Rc<RefCell<Vec<Outgoing>>>;
+
+fn db(name: &str) -> String {
+    let p = std::env::temp_dir().join(format!("durable-test-{}-{name}.db", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p.to_string_lossy().into_owned()
+}
+
+fn runtime(path: &str) -> (Runtime, Log) {
+    let log: Log = Rc::default();
+    let l = log.clone();
+    let mut rt = Runtime::open(path, GLUE, move |o| l.borrow_mut().push(o.clone())).unwrap();
+    rt.register(fast).unwrap();
+    rt.register(one).unwrap();
+    rt.register(deadline).unwrap();
+    rt.register(boom).unwrap();
+    rt.register(hidden).unwrap();
+    (rt, log)
+}
+
+fn sql(path: &str, q: &str) {
+    rusqlite::Connection::open(path).unwrap().execute_batch(q).unwrap();
+}
+
+#[tokio::test]
+async fn fast_path_stores_nothing() {
+    let path = db("fast");
+    let (rt, log) = runtime(&path);
+    assert!(matches!(rt.start("t", fast(1)).await.unwrap(), Outcome::Done(2)));
+    assert!(matches!(rt.status("t"), Err(Error::UnknownTask(_))));
+    assert!(log.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn park_restart_deliver_duplicate() {
+    let path = db("park");
+    {
+        let (rt, log) = runtime(&path);
+        assert!(matches!(rt.start("t", one(5)).await.unwrap(), Outcome::Parked));
+        let sent = log.borrow();
+        assert_eq!((sent.len(), sent[0].kind.as_str(), sent[0].payload.clone()), (1, "a", serde_json::json!(5)));
+    } // "process exits"
+    let (rt, _) = runtime(&path);
+    assert_eq!(rt.deliver("t", 0, 10u64).await.unwrap(), Status::Done(serde_json::json!(15)));
+    assert_eq!(rt.deliver("t", 0, 99u64).await.unwrap(), Status::Done(serde_json::json!(15)));
+    assert_eq!(rt.output::<u64>("t").unwrap(), Some(15));
+    // Same id again: runs, parks, and is refused before anything is sent.
+    assert!(matches!(rt.start("t", one(5)).await, Err(Error::TaskExists(_))));
+}
+
+#[tokio::test]
+async fn deadline_cancels_the_request() {
+    let path = db("deadline");
+    let (rt, log) = runtime(&path);
+    let at = durable::now_ms() + 50;
+    assert!(matches!(rt.start("t", deadline(at)).await.unwrap(), Outcome::Parked));
+    assert_eq!(log.borrow().len(), 1);
+    assert!(matches!(rt.status("t").unwrap(), Status::Parked { wake_at: Some(w), .. } if w == at));
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let ran = rt.run_due_timers().await.unwrap();
+    assert_eq!(ran.len(), 1);
+    assert_eq!(rt.status("t").unwrap(), Status::Done(serde_json::json!("timeout")));
+    assert!(rt.open_requests().unwrap().is_empty());
+    // A late result for the abandoned request is ignored.
+    assert_eq!(rt.deliver("t", 0, 1u64).await.unwrap(), Status::Done(serde_json::json!("timeout")));
+}
+
+#[tokio::test]
+async fn panic_fails_the_task() {
+    let path = db("panic");
+    let (rt, _) = runtime(&path);
+    rt.start("t", boom(1)).await.unwrap();
+    assert!(matches!(rt.deliver("t", 0, 0u64).await, Err(Error::Panicked(m)) if m.contains("zero")));
+    assert!(matches!(rt.status("t").unwrap(), Status::Failed(_)));
+}
+
+#[tokio::test]
+async fn hidden_slow_call_is_a_clear_error() {
+    let path = db("hidden");
+    let (rt, log) = runtime(&path);
+    let err = rt.start("t", hidden(1)).await.unwrap_err();
+    assert!(matches!(&err, Error::NotSerializable(m) if m.contains("trait object")), "{err}");
+    assert!(log.borrow().is_empty(), "nothing is dispatched for a task that cannot park");
+}
+
+#[tokio::test]
+async fn incompatible_snapshot_stays_parked() {
+    let path = db("incompatible");
+    let (rt, _) = runtime(&path);
+    rt.start("t", one(5)).await.unwrap();
+    // As if the parked state were written by a build with different locals.
+    sql(&path, r#"UPDATE tasks SET frame = replace(frame, '"sig":"', '"sig":"old,')"#);
+    assert!(matches!(rt.deliver("t", 0, 10u64).await, Err(Error::Incompatible(_))));
+    assert!(matches!(rt.status("t").unwrap(), Status::Parked { error: Some(_), .. }));
+    // A compatible build can resume it later; the result was kept.
+    sql(&path, r#"UPDATE tasks SET frame = replace(frame, '"sig":"old,', '"sig":"')"#);
+    assert_eq!(rt.resume("t").await.unwrap(), Status::Done(serde_json::json!(15)));
+}
+
+#[tokio::test]
+async fn redispatch_after_crash() {
+    let path = db("redispatch");
+    let (rt, _) = runtime(&path);
+    rt.start("t", one(5)).await.unwrap();
+    // As if the process died between storing the task and sending its request.
+    sql(&path, "UPDATE requests SET dispatched = 0");
+    let (rt2, log2) = runtime(&path);
+    assert_eq!(rt2.redispatch().unwrap(), 1);
+    assert_eq!(log2.borrow().len(), 1);
+    assert_eq!(rt2.redispatch().unwrap(), 0);
+    drop(rt);
+}
+
+#[tokio::test]
+async fn missing_glue_is_reported_at_register() {
+    let mut rt = Runtime::open(&db("noglue"), &[], |_| {}).unwrap();
+    let err = rt.register(one).unwrap_err();
+    assert!(err.to_string().contains("cargo durable build"), "{err}");
+}

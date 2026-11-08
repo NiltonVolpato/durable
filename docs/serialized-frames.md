@@ -15,7 +15,7 @@ Serializing a frame needs, for each suspension point, the live locals, their typ
 
 ## What the driver reads
 
-- **Roots:** `async fn`s marked `#[durable::workflow]` (`#![feature(register_tool)] #![register_tool(durable)]`).
+- **Roots:** `async fn`s marked `#[durable::workflow]`. In the alpha, the attribute macro adds a hidden `const` naming the function, which the driver finds. The PoC used a tool attribute (`#![register_tool(durable)]`) instead.
 - **Frames reachable from the roots**, with concrete generic arguments, from any crate:
   - coroutines;
   - closures (their captures);
@@ -81,7 +81,7 @@ At compile time, the driver rejects any slow await whose live state cannot be se
 - **Slow frames** (fixpoint over the reachable frames). A frame can park if it awaits one of:
   - a slow leaf;
   - a frame that can park (a coroutine, or a `Structural` combinator with such a field);
-  - an opaque wrapper with such a frame among its generic arguments (`Ephemeral<{async block}>`).
+  - a type the driver cannot see into that has a slow leaf or such a frame nested anywhere inside it (`Timeout<Request<_>>`, `tokio::join!`'s closure, `Ephemeral<{async block}>`).
 - **The check:** at each slow state, every live value must pass the glue rules, and so must every closure or combinator it holds, recursively.
 - **Not seen:** type-erased futures (`Pin<Box<dyn Future>>`) count as fast. A slow call hidden there is only caught at run time, when serialization fails.
 - **Fast awaits are not checked,** so borrows and tokio I/O across them need no annotation. Code not reachable from a root (the runtime, raw-copy workflows) is not checked.
@@ -182,5 +182,5 @@ Ergonomics finding: values with a destructor stay live until the end of their sc
 - Types are named by path from the glue module, so private types in other modules fail to compile in pass 2. Foreign private types work when they sit inside frames that are recursed into.
 - A failed deserialize leaks the values written before the failure.
 - Stable state keys (see snapshot versioning).
-- The two-pass build should become one command (`cargo durable build`).
+- `cargo durable build` hides the two passes, but workflow crates still compile twice when the glue changes.
 - The driver pins the project to rustc internals, which change on every nightly. Several APIs had already changed on the nightly used here.

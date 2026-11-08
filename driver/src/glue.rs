@@ -126,6 +126,18 @@ impl<'a, 'tcx> Planner<'a, 'tcx> {
         if let Some(why) = unsupported(ty) {
             return Err(why);
         }
+        // The glue is included at the crate root and names types by path.
+        let tcx = self.cx.tcx;
+        for t in ty.walk().filter_map(|a| a.as_type()) {
+            if let ty::Adt(def, _) = t.kind()
+                && !tcx.visibility(def.did()).is_accessible_from(rustc_span::def_id::CRATE_DEF_ID, tcx)
+            {
+                return Err(format!(
+                    "`{}` is private to its module; the generated glue (at the crate root) cannot name it: make it `pub(crate)`",
+                    tcx.def_path_str(def.did())
+                ));
+            }
+        }
         if self.serde.is_none() {
             return Err("serde is not in the crate graph".into());
         }

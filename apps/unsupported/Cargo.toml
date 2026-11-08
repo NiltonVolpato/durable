@@ -1,0 +1,11 @@
+[package]
+name = "unsupported"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Code outside the alpha subset, and the errors it gets. Run check.sh."
+
+[dependencies]
+durable = { path = "../../durable" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }

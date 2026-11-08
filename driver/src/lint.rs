@@ -4,8 +4,9 @@
 //! A frame can park if it awaits a type implementing `durable::SlowLeaf`,
 //! or another frame that can park (a coroutine, or a `Structural` combinator
 //! with such a field). Computed as a fixpoint over the collected frames.
-//! A wrapper the driver cannot see into counts as slow if one of its generic
-//! arguments is a frame that can park (e.g. `Ephemeral<{async block}>`).
+//! A type the driver cannot see into counts as slow if any type nested in it
+//! is a slow leaf or a frame that can park (`Timeout<Request<_>>`,
+//! `tokio::join!`'s `PollFn<{closure}>`, `Ephemeral<{async block}>`).
 //! Type-erased futures (`Pin<Box<dyn Future>>`) count as fast: a slow leaf
 //! hidden there is only caught at run time, when serialization fails.
 
@@ -27,16 +28,21 @@ struct Slow<'a, 'tcx> {
 
 impl<'tcx> Slow<'_, 'tcx> {
     fn can_park(&self, ty: Ty<'tcx>) -> bool {
-        match self.planner.id(ty) {
-            Some(i) => self.slow[i],
-            // A wrapper the driver cannot see into (e.g. `Ephemeral<F>`): it can
-            // park if it is a slow leaf, or wraps a frame that can park.
-            None => {
-                matches!(ty.kind(), ty::Adt(..))
-                    && ((!ty.has_erased_regions() && !ty.has_escaping_bound_vars() && glue::implements(self.cx.tcx, self.leaf, ty, &[]))
-                        || ty.walk().skip(1).filter_map(|a| a.as_type()).any(|t| self.planner.id(t).is_some_and(|i| self.slow[i])))
-            }
+        if let Some(i) = self.planner.id(ty) {
+            return self.slow[i];
         }
+        // A type the driver cannot see into (`Timeout<F>`, `PollFn<{closure}>`,
+        // `Ephemeral<F>`, a tuple behind `&mut`): it can park if anything
+        // nested in it is a slow leaf or a frame that can park.
+        ty.walk().filter_map(|a| a.as_type()).any(|t| match self.planner.id(t) {
+            Some(i) => self.slow[i],
+            None => {
+                matches!(t.kind(), ty::Adt(..))
+                    && !t.has_erased_regions()
+                    && !t.has_escaping_bound_vars()
+                    && glue::implements(self.cx.tcx, self.leaf, t, &[])
+            }
+        })
     }
 
     fn parks_at(&self, st: &State<'tcx>) -> bool {

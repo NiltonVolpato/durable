@@ -1,6 +1,6 @@
 # Runtime
 
-How parked tasks are stored, woken and resumed ([overview](README.md)). What exists today is minimal: a poll loop (`poc`) and a single-threaded tokio host (`probe`), with slow results read from `results/<id>` files. This doc covers the current mechanics and the v2 design.
+How parked tasks are stored, woken and resumed ([overview](README.md)). The alpha runtime (`durable/src/runtime.rs`, [user guide](alpha.md)) implements most of the v2 plan below on SQLite: store-then-dispatch requests, idempotent delivery, per-task locks, durable timers, cancellation. The PoC hosts (`poc`, `probe`) read slow results from `results/<id>` files.
 
 ## Leaves
 
