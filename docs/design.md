@@ -11,11 +11,12 @@ The core ideas:
 - A `Durable` auto trait marks types that hold no absolute pointers. The compiler checks it structurally, the same way it checks `Send` on async blocks.
 - Each task lives in one contiguous arena. Pointers inside the arena are offsets (from the arena base, or self-relative `RelRef`), so the whole arena can be moved with a memcpy.
 - Only the state live at a slow call has to be durable. Fast sections can use borrows, tokio I/O and the heap freely.
+- Alternative found in the PoC: a rustc_driver reads the compiler's coroutine layouts and generates serde glue, so a parked frame is serialized field by field (heap data allowed) instead of copied as raw bytes.
 - Frame bytes are only valid for the code that wrote them. Workflows are built as shared libraries, named by the hash of the `.so`, and loaded with `dlopen` on resume.
 
 It needs nightly (`auto_traits`, `negative_impls`).
 
-Status: v0 and v1 of the PoC work (see [PoC status](#poc-status)). Tested on `rustc 1.102.0-nightly (2026-11-07)`, macOS arm64 (PIE).
+Status: v0, v1 and the serialized-frame experiment work (see [PoC status](#poc-status)). Tested on `rustc 1.102.0-nightly (2026-11-07)`, macOS arm64 (PIE).
 
 ## Motivating use case
 
@@ -140,7 +141,9 @@ Its only advantage over base-relative handles is that deref needs no context. Bu
 - A `DVec` of them can grow.
 - Cost: a thread-local read plus the task check on each deref, and no deref outside a poll.
 
-Leaning towards dropping `RelRef`.
+Decision: replace `RelRef` with base-relative `ARef`. Not implemented yet.
+
+Decision: do not grow vectors in the arena (bump allocation wastes every old buffer). Build with a normal heap `Vec`. If the data is not needed across a slow await, that is it. If it is, freeze it into the arena once it has its final size: copy into an exact-size arena slice (`AVec`/`ASlice`, no spare capacity). Not implemented yet.
 
 Known aliasing hole: `RelRef::get` returns `&T` without tracking it against `ABox::get_pin` / `DVec::get_pin` (`&mut` to the same target). Safe code can alias.
 
@@ -250,30 +253,84 @@ pub struct WorkflowVTable {
 
 Open problem (ignored for now): a `cdylib` statically links its own std and tokio. The `.so`'s tokio has its own runtime-context thread-local, so `tokio::spawn` or tokio I/O inside a workflow sees no runtime ("no reactor running"). That conflicts with "fast sections can use tokio freely". Linking std and tokio dynamically would fix it, but then updating their versions is hard. Other options: route fast I/O through `HostVTable`, or run a small runtime inside each `.so`.
 
-## Alternative: serialize frames instead of copying them
+## Serialized frames (rustc_driver experiment)
 
-Idea: make the coroutine `Serialize + Deserialize`, so a parked task is stored field by field instead of as raw bytes.
+Idea: serialize a parked coroutine field by field with serde instead of copying raw bytes. A library cannot do this: it needs the live locals, types and offsets at each suspension point, which only the compiler knows. A proc macro sees too little (see Option B). `coroutine_clone` derives `Clone` only for movable coroutines; `async fn` futures are immovable and get no impl (checked, E0277).
 
-No library can do this. Serializing a frame means knowing, at each suspension point, which saved locals are live, their types and their offsets. Only the compiler knows that, and the coroutine type is unnameable. A proc macro sees the same too-little as in Option B. The compiler already derives `Clone` for coroutines (`coroutine_clone`), but only for movable coroutines. `async fn` futures are immovable, and the check shows they get no `Clone` impl (E0277). The compiler cannot derive arbitrary traits structurally either.
+The experiment uses `durable-driver` (`driver/`): rustc plus a pass after analysis, run as `RUSTC_WORKSPACE_WRAPPER`. It needs the `rustc-dev` and `llvm-tools` components (in `rust-toolchain.toml`).
 
-Possible route: a rustc_driver (the same machinery as Option B, needs `rustup component add rustc-dev llvm-tools`):
+What it reads, per non-generic coroutine in the crate:
 
-- For each workflow coroutine, read `tcx.coroutine_layout(..)` (variant → saved locals → types) and `layout_of` (field offsets, discriminant, drop flags).
-- Generate per-variant glue: serialize the discriminant, then each live saved local through `T: Serialize` at its offset. Nested `async fn` frames recurse. Hand-written leaves and combinators implement serde by hand.
-- Check, at slow points only, that every live saved local is `Serialize + DeserializeOwned` (this replaces `Durable`).
+- `tcx.coroutine_layout(def_id, args)`: for each variant, the saved locals, their types and debuginfo names.
+- `tcx.layout_of(ty)`: field offsets per variant, the tag (direct encoding, 1 byte here), size and alignment.
+- `rustc_const_eval::util::type_name`: matches `std::any::type_name::<F>()` at run time.
 
-What it buys:
+Validated: `driver/decode_snapshot.py` decodes a real parked `snap.bin` from the raw-copy path using only the dump, including the nested `second_opinion` frame.
 
-- Heap types (`String`, `Vec`, `HashMap`, `Box`) can be held across slow calls. The arena and `RelRef` become unnecessary.
-- The format can be keyed by stable names (await point, local name) instead of layout, so some recompiles keep old snapshots valid. That partly addresses "a bug fix cannot reach parked tasks".
-- Snapshots stop depending on the architecture.
+### Glue generation (two passes)
 
-What it costs:
+`build-glue.sh` runs two builds:
 
-- A custom build step tied to rustc internals (unstable, changes per nightly).
-- Generated glue must use offsets from the same build as the frame.
-- Borrows at slow points are still forbidden.
-- Mapping a snapshot onto a changed coroutine stays fragile when await points or locals change.
+1. Pass 1 builds with an empty glue table. The driver writes `glue.rs`.
+2. Pass 2 includes `glue.rs` (via `build.rs` → `$OUT_DIR/durable_glue.rs`). The driver regenerates the glue and fails the build if it differs.
+
+Pass 2 confirms that adding the glue does not change any coroutine layout.
+
+Generated code, per coroutine `i` and suspension state:
+
+```rust
+unsafe fn __ser_0(p: *const u8) -> Result<Value> { unsafe {
+    match ::core::ptr::read(p.add(160) as *const u8) {       // tag
+        5 => {
+            let mut m = Map::new();
+            m.insert("state".into(), 5u64.into());
+            m.insert("at".into(), "src/main.rs:38:43: 38:48".into());
+            m.insert("body".into(), ser_array::<u8, 64>(p.add(80))?);
+            m.insert("quick".into(), ser_field::<u64>(p.add(144))?);
+            m.insert("a".into(), ser_field::<u64>(p.add(152))?);
+            m.insert("__awaitee".into(), __ser_2(p.add(168))?);   // nested async fn frame
+            Ok(m.into())
+        }
+        3 => Err("...state 3 at src/main.rs:33:6 is not serializable: __awaitee: \
+                  `Ephemeral<{async block}>` holds an unnameable type".into()),
+        ...
+}}}
+// __de_i writes each field at its offset, then the tag.
+pub static GLUE: &[Entry] = &[Entry { type_name, size, align, ser: __ser_0, de: __de_0 }, ...];
+```
+
+Rules:
+
+- A field goes through `T: Serialize + Deserialize` if the driver can prove the impl (trait query against `serde_core`).
+- `[T; N]` goes through a slice, because serde stops at N = 32.
+- A nested coroutine recurses into its own glue.
+- A state with a reference, raw pointer, function, trait object, unnameable type, missing serde impl, or unnamed `bool` (likely a drop flag) gets an error arm with the reason. This is a precise, per-state version of the `Durable` check, but it reports at run time.
+- `async fn` bodies skip upvars after the first resume, because their arguments were moved into locals. Other coroutines also serialize their upvars.
+
+Runtime: `glue::serialize(GLUE, &task)` / `glue::deserialize(GLUE, || wf(..), cap, &json)`. Parking serializes the frame and then drops the task normally, which frees its heap data. Resume builds a fresh frame: it writes the live fields of the state and the tag, and leaves every other byte uninitialized.
+
+### Results
+
+- `profile` holds a `Vec<String>` and a `String` (heap, not `Durable`) across two slow calls. It finishes in a third process with 60. The snapshot is readable JSON, nested frame included.
+- `classify` works the same way (49).
+- `leaky` is refused: `s: &[u8] holds a reference`. `racy` is refused by the ephemeral check.
+- The rejection messages for `triage` (arena handles), `classify` state 3 (ephemeral) and `leaky` are exactly the answers the Option B lint needs.
+
+What it changes in the design:
+
+- Heap data can live across slow calls, so the arena, `ARef`, the frozen-`Vec` scheme and `Durable` are no longer needed for that.
+- The format is keyed by state number and local name, not offsets. In principle a recompile that keeps a function's await points and locals could still load old snapshots. Not tested yet.
+- Snapshots no longer depend on the target architecture.
+
+Open:
+
+- Turn the per-state errors into compile errors at slow points (the lint): needs "which states are slow".
+- Not checked under Miri. Resume leaves non-live bytes uninitialized. That should be fine for `async fn` (only the live fields and the tag are read), but it is unverified. Under Miri the build flags differ, so the glue would need to be generated for Miri's build.
+- Generic coroutines, closures and `async` blocks with upvars held by a parent frame, drop flags.
+- Types are named by path from the glue module, so private types in other modules fail to compile in pass 2.
+- A failed deserialize leaks the fields written before the failure.
+- Glue from a different build: `Entry` checks size and alignment only. State numbering is not versioned yet.
+- The driver pins the project to rustc internals, which change on every nightly (several APIs changed between the 2025 docs and this nightly).
 
 ## Known holes and open questions
 
@@ -312,10 +369,11 @@ Open questions:
 
 ## PoC status
 
-Code: `src/lib.rs` (trait, leaves, `Ephemeral`, `run`), `src/arena.rs` (`Task`, `ABox`, `DVec`, `RelRef`), `src/main.rs` (`poc` binary), `src/compile_checks.rs` (doctests), `tests/roundtrip.rs`, `demo.sh`.
+Code: `src/lib.rs` (trait, leaves, `Ephemeral`, `run`), `src/arena.rs` (`Task`, `ABox`, `DVec`, `RelRef`), `src/glue.rs` (serialized-frame runtime), `src/main.rs` (`poc` binary), `src/compile_checks.rs` (doctests), `tests/roundtrip.rs`, `driver/` (rustc_driver), `build-glue.sh`, `demo.sh`.
 
 ```
 cargo test                    # compile checks + in-process round trip
+./build-glue.sh               # two-pass build with serde glue (demo.sh runs it)
 ./demo.sh                     # multi-process demo
 MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --test roundtrip
 ```
@@ -336,6 +394,10 @@ Native `async fn`, frame in a `Box`, hand-written poll loop with `Waker::noop()`
 - `triage` workflow: a `DVec<u64>` that grows before and after resume, an `ABox<Note>`, and a fixed-capacity `DVec<RelRef<Note>>` pointing at it, all held across two slow awaits. Finishes in a third process with 574. The `RelRef` resolves to the same offset in each new arena.
 - Negative impls for OS handles and `Instant`, with compile checks.
 - `tests/roundtrip.rs` passes under Miri (evict → scribble over old bytes → resume into a fresh arena, twice), apart from the expected warning from `with_exposed_provenance`.
+
+### Serialized-frame experiment: done
+
+See [Serialized frames](#serialized-frames-rustc_driver-experiment). `./build-glue.sh`, then `poc sstart profile 7` / `poc sresume`.
 
 ### v2: next
 

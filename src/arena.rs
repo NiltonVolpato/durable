@@ -128,8 +128,24 @@ pub struct Task<F: Future> {
     _f: PhantomData<F>,
 }
 
-impl<F: Future + Durable> Task<F> {
+impl<F: Future> Task<F> {
     pub fn new(task_id: u64, cap: usize, fut: F) -> Self {
+        let r: Result<Self, String> = unsafe {
+            Self::new_with(task_id, cap, |p| {
+                p.write(fut);
+                Ok(())
+            })
+        };
+        r.unwrap()
+    }
+
+    /// Build the root in place. Safety: on `Ok`, `init` fully initialized `*p`.
+    /// On `Err` the root is treated as uninitialized and not dropped.
+    pub unsafe fn new_with(
+        task_id: u64,
+        cap: usize,
+        init: impl FnOnce(*mut F) -> Result<(), String>,
+    ) -> Result<Self, String> {
         let align = align_of::<F>().max(64);
         let arena = Arena::zeroed(cap, align);
         let h = arena.header();
@@ -146,13 +162,15 @@ impl<F: Future + Durable> Task<F> {
             });
         }
         let (off, _) = enter(arena.base.as_ptr(), || alloc_in_current(Layout::new::<F>()));
-        unsafe {
-            (*h).root_off = off;
-            arena.base.as_ptr().add(off as usize).cast::<F>().write(fut);
-        }
-        Task { arena, live: true, _f: PhantomData }
+        unsafe { (*h).root_off = off };
+        let mut task = Task { arena, live: false, _f: PhantomData };
+        init(task.root_ptr())?;
+        task.live = true;
+        Ok(task)
     }
+}
 
+impl<F: Future + Durable> Task<F> {
     /// `_ctor` is never called; it only names the unnameable `F`.
     pub fn resume(_ctor: impl FnOnce() -> F, snap: &Snapshot) -> Self {
         assert!(align_of::<F>() <= snap.align as usize, "alignment mismatch");
@@ -165,10 +183,19 @@ impl<F: Future + Durable> Task<F> {
         assert_eq!(h.used as usize, snap.bytes.len(), "snapshot length mismatch");
         Task { arena, live: true, _f: PhantomData }
     }
+
+    /// Copy out the used prefix and give up ownership without running drop.
+    pub fn evict(mut self) -> Snapshot {
+        self.live = false;
+        let h = unsafe { &*self.arena.header() };
+        let bytes = unsafe { std::slice::from_raw_parts(self.arena.base.as_ptr(), h.used as usize) };
+        // Includes uninit padding: ignored in the PoC.
+        Snapshot { cap: h.cap, align: h.align, bytes: bytes.to_vec() }
+    }
 }
 
 impl<F: Future> Task<F> {
-    fn root_ptr(&self) -> *mut F {
+    pub(crate) fn root_ptr(&self) -> *mut F {
         unsafe { self.arena.base.as_ptr().add((*self.arena.header()).root_off as usize).cast() }
     }
     pub fn base(&self) -> *const u8 {
@@ -193,14 +220,8 @@ impl<F: Future> Task<F> {
         let root = unsafe { Pin::new_unchecked(&mut *self.root_ptr()) };
         enter(self.arena.base.as_ptr(), || root.poll(cx))
     }
-
-    /// Copy out the used prefix and give up ownership without running drop.
-    pub fn evict(mut self) -> Snapshot {
-        self.live = false;
-        let h = unsafe { &*self.arena.header() };
-        let bytes = unsafe { std::slice::from_raw_parts(self.arena.base.as_ptr(), h.used as usize) };
-        // Includes uninit padding: ignored in the PoC.
-        Snapshot { cap: h.cap, align: h.align, bytes: bytes.to_vec() }
+    pub fn task_id(&self) -> u64 {
+        unsafe { (*self.arena.header()).task_id }
     }
 }
 

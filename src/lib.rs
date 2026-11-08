@@ -8,6 +8,8 @@ use std::task::{Context, Poll, Waker};
 
 pub mod arena;
 pub mod compile_checks;
+pub mod glue;
+pub use serde_json;
 pub use arena::{ABox, DVec, RelRef, Snapshot, Task};
 use arena::with_header;
 
@@ -46,6 +48,7 @@ impl !Durable for std::time::Instant {}
 // ---------- leaves ----------
 
 /// Slow leaf: ready once `results/<id>` exists, otherwise parks.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Slow {
     id: u64,
 }
@@ -67,6 +70,7 @@ impl Future for Slow {
 }
 
 /// A non-slow await: Pending once, then Ready.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct YieldOnce(bool);
 pub fn yield_once() -> YieldOnce {
     YieldOnce(false)

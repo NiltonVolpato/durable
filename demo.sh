@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end v0 demo: each `poc` call is a separate process.
 set -u
-cargo build -q --release || exit 1
+./build-glue.sh >/dev/null || exit 1 # two-pass build with serde glue
 BIN="$(cargo metadata -q --format-version 1 --no-deps | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])')/release/durable-poc"
 W="$(mktemp -d)"; mkdir -p "$W/results"; cd "$W" || exit 1
 
@@ -26,3 +26,12 @@ echo "== racy (join slow+ephemeral): run-level check refuses eviction"
 rm -f snap.bin results/*
 echo "== racy without run-level check: expect crash/garbage"
 POC_SKIP_EPHEMERAL_CHECK=1 "$BIN" start racy 7; echo 40 > results/7; "$BIN" resume; echo "exit=$?"
+
+rm -f snap.bin results/*
+echo "== serialized frames: profile holds Vec<String> + String across slow calls"
+"$BIN" sstart profile 7; echo 40 > results/7; "$BIN" sresume; cat snap.json; echo
+echo 2 > results/1007; "$BIN" sresume   # expect 60
+
+rm -f snap.json results/*
+echo "== serialized frames: leaky is refused (reference at the slow point)"
+"$BIN" sstart leaky 7; echo "exit=$?"
