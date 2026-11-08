@@ -13,8 +13,8 @@
 //! Parking drops the in-memory frame, so a live value's destructor runs at
 //! park and again on the rebuilt copy. A live value whose type has a user
 //! `Drop` impl anywhere inside is rejected unless that type implements
-//! `durable::DropOnPark`. std types are trusted (their destructors only free
-//! memory), but their type arguments are checked.
+//! `durable::DropOnPark`. std types and types trusted in the config
+//! (`config.rs`) are not flagged, but their type arguments are checked.
 
 use crate::glue::{self, Kind, Planner, Step};
 use crate::{Ctx, Field, Frame, Shape, State};
@@ -82,7 +82,7 @@ impl<'tcx> Drops<'_, 'tcx> {
         glue::find_owned(self.cx, ty, &mut |t| match t.kind() {
             _ if !t.needs_drop(tcx, ty::TypingEnv::fully_monomorphized()) => Step::Skip,
             ty::Adt(def, _) if def.is_manually_drop() || self.opted_in(t) => Step::Skip,
-            ty::Adt(def, _) if !glue::is_std(tcx, def.did()) && tcx.adt_destructor(def.did()).is_some() => Step::Found,
+            ty::Adt(def, _) if !self.cx.trusted(def.did()) && tcx.adt_destructor(def.did()).is_some() => Step::Found,
             _ => Step::Descend,
         })
     }

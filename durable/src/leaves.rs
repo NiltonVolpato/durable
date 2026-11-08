@@ -21,6 +21,15 @@ pub trait SlowLeaf {}
 /// durable-driver rejects such types otherwise.
 pub trait DropOnPark {}
 
+/// Marks a handle valid only in the process that created it: a slotmap key,
+/// an index into a global registry, a pool slot id. It may serialize fine,
+/// but after a resume in another process it points at nothing, or at a
+/// different object with the same id. durable-driver rejects it anywhere
+/// inside a value live at a slow await. Library authors: implement it on
+/// such types. For types from other crates, list them under `process-local`
+/// in `[package.metadata.durable]`.
+pub trait ProcessLocal {}
+
 /// An external call whose result is delivered later with `Runtime::deliver`.
 ///
 /// On first poll it gets a request id and is queued for dispatch; the request

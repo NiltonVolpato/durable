@@ -15,7 +15,7 @@ mod runtime;
 mod task;
 
 pub use combinators::{Either, Join2, Select2, Structural, join2, select2};
-pub use leaves::{DropOnPark, Request, SleepUntil, SlowLeaf, now_ms, request, sleep_until};
+pub use leaves::{DropOnPark, ProcessLocal, Request, SleepUntil, SlowLeaf, now_ms, request, sleep_until};
 pub use task::is_parking;
 pub use runtime::{Error, Outcome, Outgoing, Runtime, Status, Workflow};
 

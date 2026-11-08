@@ -24,6 +24,7 @@ extern crate rustc_middle;
 extern crate rustc_span;
 extern crate rustc_trait_selection;
 
+mod config;
 mod glue;
 mod lint;
 mod mir;
@@ -85,6 +86,7 @@ pub struct Ctx<'tcx> {
     /// The runtime crate in the crate graph: `durable`, or the PoC's `durable_poc`.
     pub rt: &'static str,
     structural: Option<rustc_span::def_id::DefId>,
+    pub config: config::Config,
 }
 
 fn is_fn_body(tcx: TyCtxt<'_>, def_id: rustc_span::def_id::DefId) -> bool {
@@ -100,6 +102,26 @@ impl<'tcx> Ctx<'tcx> {
     }
 
     /// Types the driver handles field by field instead of through serde.
+    /// A type's public path for the config lists; local types get the crate name.
+    pub fn type_path(&self, did: DefId) -> String {
+        let p = ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(did));
+        if did.is_local() { format!("{}::{p}", self.tcx.crate_name(LOCAL_CRATE)) } else { p }
+    }
+
+    /// std types, and types the config trusts: destructor and internals trusted.
+    pub fn trusted(&self, did: DefId) -> bool {
+        matches!(self.tcx.crate_name(did.krate).as_str(), "std" | "core" | "alloc") || self.config.trusted(&self.type_path(did))
+    }
+
+    /// Marked `durable::ProcessLocal`, or listed as process-local in the config.
+    pub fn process_local(&self, ty: Ty<'tcx>) -> bool {
+        let ty::Adt(def, _) = ty.kind() else { return false };
+        self.config.process_local(&self.type_path(def.did()))
+            || (!ty.has_erased_regions()
+                && !ty.has_escaping_bound_vars()
+                && glue::find_trait(self.tcx, &[self.rt], "ProcessLocal").is_some_and(|t| glue::implements(self.tcx, t, ty, &[])))
+    }
+
     pub fn is_frame(&self, ty: Ty<'tcx>) -> bool {
         match ty.kind() {
             ty::Coroutine(..) | ty::Closure(..) => !ty.has_param() && !ty.has_escaping_bound_vars(),
@@ -331,12 +353,26 @@ fn dump(frames: &[Frame<'_>]) -> String {
 
 struct Driver;
 
+fn wanted(tcx: TyCtxt<'_>) -> bool {
+    let krate = tcx.crate_name(LOCAL_CRATE).to_string();
+    std::env::var("DURABLE_CRATES").map_or(true, |w| w.split(',').any(|c| c == krate))
+}
+
 impl Callbacks for Driver {
+    /// Cargo ignores `[package.metadata]` changes; list Cargo.toml in the
+    /// dep-info (written right after this) so editing the config rebuilds.
+    fn after_expansion<'tcx>(&mut self, _: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        if wanted(tcx)
+            && let Some(path) = config::manifest()
+        {
+            tcx.sess.file_depinfo.borrow_mut().insert(Symbol::intern(&path));
+        }
+        Compilation::Continue
+    }
+
     fn after_analysis<'tcx>(&mut self, _: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         let krate = tcx.crate_name(LOCAL_CRATE).to_string();
-        if let Ok(wanted) = std::env::var("DURABLE_CRATES")
-            && !wanted.split(',').any(|c| c == krate)
-        {
+        if !wanted(tcx) {
             return Compilation::Continue;
         }
         // The runtime crate this crate uses, if any.
@@ -345,7 +381,11 @@ impl Callbacks for Driver {
             .find(|c| glue::find_trait(tcx, &[c], "SlowLeaf").is_some());
         let Some(rt) = rt else { return Compilation::Continue };
         glue::set_runtime(rt);
-        let cx = Ctx { tcx, rt, structural: glue::find_trait(tcx, &[rt], "Structural") };
+        let config = match config::load() {
+            Ok(c) => c,
+            Err(e) => tcx.dcx().fatal(e),
+        };
+        let cx = Ctx { tcx, rt, structural: glue::find_trait(tcx, &[rt], "Structural"), config };
         let frames = collect(&cx);
         if frames.is_empty() {
             return Compilation::Continue; // e.g. the lib target of a lib+bin package

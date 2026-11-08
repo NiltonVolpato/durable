@@ -91,6 +91,17 @@ async fn shared_config(x: u64) -> String {
     format!("{name}{}", a + cfg.bonus)
 }
 
+/// Third-party types with `Drop` impls, trusted by durable-driver's defaults.
+#[durable::workflow]
+async fn trusted_types(x: u64) -> u64 {
+    let b = bytes::Bytes::from_static(b"abc");
+    let s: smallvec::SmallVec<[u64; 2]> = smallvec::smallvec![x, x];
+    let mut m = indexmap::IndexMap::new();
+    m.insert("k".to_string(), x);
+    let a: u64 = request("a", x).await;
+    a + b.len() as u64 + s.iter().sum::<u64>() + m["k"]
+}
+
 type Log = Rc<RefCell<Vec<Outgoing>>>;
 
 fn db(name: &str) -> String {
@@ -111,6 +122,7 @@ fn runtime(path: &str) -> (Runtime, Log) {
     rt.register(two_steps).unwrap();
     rt.register(leased).unwrap();
     rt.register(shared_config).unwrap();
+    rt.register(trusted_types).unwrap();
     (rt, log)
 }
 
@@ -263,4 +275,12 @@ async fn immutable_arc_survives_park() {
     let (rt, _) = runtime(&path);
     assert!(matches!(rt.start("t", shared_config(1)).await.unwrap(), Outcome::Parked));
     assert_eq!(rt.deliver("t", 0, 2u64).await.unwrap(), Status::Done(serde_json::json!("n102")));
+}
+
+#[tokio::test]
+async fn trusted_types_survive_park() {
+    let path = db("trusted");
+    let (rt, _) = runtime(&path);
+    assert!(matches!(rt.start("t", trusted_types(1)).await.unwrap(), Outcome::Parked));
+    assert_eq!(rt.deliver("t", 0, 10u64).await.unwrap(), Status::Done(serde_json::json!(16)));
 }

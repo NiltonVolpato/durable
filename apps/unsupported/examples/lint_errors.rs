@@ -6,6 +6,8 @@
 //! - Opaque: a value whose state the driver cannot see or name (`dyn`,
 //!   unnameable types, foreign futures without serde impls).
 //! - Identity: sharing that a copy loses (`Rc` / `Arc` to mutable data, `Weak`).
+//! - Handle: an id valid only in the process that created it (`ProcessLocal`,
+//!   or listed in the config). Not detectable structurally: it must be marked.
 //!
 //! Each case below is labeled with its class. A new case that fits none of
 //! them points at a gap in this model.
@@ -120,6 +122,14 @@ async fn consume(l: Lease) -> u64 {
     l.id
 }
 
+/// Inside a trusted type: `SmallVec` itself is trusted, its items are not.
+#[durable::workflow]
+async fn lease_in_smallvec(id: u64) -> u64 {
+    let ls: smallvec::SmallVec<[Lease; 2]> = smallvec::smallvec![Lease { id }];
+    let v: u64 = request("a", id).await;
+    v + ls.len() as u64
+}
+
 /// Held by a future that has not started yet.
 #[durable::workflow]
 async fn unstarted_lease(id: u64) -> u64 {
@@ -170,9 +180,45 @@ async fn weak_ref(id: u64) -> u64 {
     v + weak.upgrade().map_or(0, |a| *a)
 }
 
+// ---------- Handle ----------
+
+/// Marked by its library.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct SlotId(u32);
+impl durable::ProcessLocal for SlotId {}
+
+/// Listed under `process-local` in this package's Cargo.toml.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct ConnId(u32);
+
+#[durable::workflow]
+async fn slot_id(id: u64) -> u64 {
+    let slot = SlotId(3);
+    let v: u64 = request("a", id).await;
+    v + slot.0 as u64
+}
+
+#[durable::workflow]
+async fn conn_id(id: u64) -> u64 {
+    let conns = vec![ConnId(1)];
+    let v: u64 = request("a", id).await;
+    v + conns.len() as u64
+}
+
+/// In the built-in list (`slotmap::KeyData`, inside every slotmap key).
+#[durable::workflow]
+async fn slotmap_key(id: u64) -> u64 {
+    let mut sm = slotmap::SlotMap::new();
+    let k: slotmap::DefaultKey = sm.insert(id);
+    drop(sm);
+    let v: u64 = request("a", id).await;
+    v + (k == slotmap::DefaultKey::default()) as u64
+}
+
 durable::glue!();
 fn main() {
     let _ = (private::private_type(1), borrow_across(1), tokio_join(1), tokio_timeout(1), option_of_future(1));
-    let _ = (lease_across(1), nested_lease(1), closure_lease(1), unstarted_lease(1));
+    let _ = (lease_across(1), nested_lease(1), closure_lease(1), unstarted_lease(1), lease_in_smallvec(1));
+    let _ = (slot_id(1), conn_id(1), slotmap_key(1));
     let _ = (arc_state(1), rc_field(1), arc_vec_cell(1), weak_ref(1));
 }

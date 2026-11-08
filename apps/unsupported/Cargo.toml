@@ -11,6 +11,15 @@ durable = { path = "../../durable" }
 serde = { version = "1", features = ["derive", "rc"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 
+[dev-dependencies]
+# Used by examples/lint_errors.rs.
+slotmap = { version = "1", features = ["serde"] }
+smallvec = { version = "1", features = ["serde"] }
+
+[package.metadata.durable]
+# A handle from "another crate" (here a local one, to keep the example small).
+process-local = ["lint_errors::ConnId"]
+
 # The examples are meant not to compile; only check.sh builds them.
 [features]
 check = []

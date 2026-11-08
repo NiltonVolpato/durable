@@ -70,6 +70,7 @@ Each app has a `demo.sh` that runs one process per step.
 | `request::<T>(kind, payload)` | Slow call. Parks until `deliver(task, req_id, T)`. |
 | `sleep_until(ms)` | Durable timer, wall clock in ms (`now_ms()`). |
 | `DropOnPark`, `is_parking()` | Opt-in for a type whose destructor may run at park, and how that destructor tells park from the real end (see below). |
+| `ProcessLocal` | Marks a handle valid only in its process; rejected at slow awaits (see below). |
 | `join2`, `select2`, `Either` | Combinators usable at slow awaits. The loser of `select2` is dropped, which cancels its requests. |
 | `Runtime::open(path, GLUE, dispatch)` | `dispatch` sends a parked task's requests, after they are stored. |
 | `register(wf)` | Every root, at startup, before resuming anything. |
@@ -108,8 +109,28 @@ Put together, a value stored at a slow await must serialize and have none of:
 - **Effect**: a destructor with a side effect (`Drop` without `DropOnPark`).
 - **Opaque**: state the driver cannot see or name (`dyn`, unnameable types, foreign futures without serde impls).
 - **Identity**: sharing a copy loses (`Rc` / `Arc` to mutable data, `Weak`).
+- **Handle**: an id valid only in the process that created it (a slotmap key, an index into a global registry, a pool slot id). It is plain data that serializes fine, but after a resume in another process it points at nothing, or at a different object with the same id. No structural check can see this, so such types must be marked: `impl durable::ProcessLocal for T {}` (for library authors), or `process-local` in the config below. `slotmap` keys, `generational_arena::Index` and `thunderdome::Index` are marked by default.
 
 `apps/unsupported/examples/lint_errors.rs` labels each rejected case with its class. A case that fits none of them is a gap in this model.
+
+### Types from other crates
+
+The orphan rule stops you from implementing `DropOnPark` or `ProcessLocal` for another crate's type, so `durable-driver` reads lists from the workflow crate's `Cargo.toml`:
+
+```toml
+[package.metadata.durable]
+trusted = [
+    { type = "bytes::Bytes", drop = "frees-memory", sharing = "immutable" },
+]
+process-local = ["my_pool::SlotId"]
+```
+
+A **trusted** type is treated like a std type: its own destructor and internals are trusted, its type arguments are still checked (`SmallVec<[Lease; 2]>` is rejected). Each entry must state both facts, because a refcounted type passes the Effect check only through this list:
+
+- `drop = "frees-memory"`: its destructor only frees memory (no Effect);
+- `sharing = "immutable"` (shared data that cannot change) or `"unshared"` (never shared with another value): a copy on resume loses nothing (no Identity).
+
+An entry missing either fact is a build error. Paths are public paths (`bytes::Bytes`), or `crate::*`. Built in: `bytes::Bytes`, `bytes::BytesMut`, `smallvec::SmallVec`, `arrayvec::ArrayVec` / `ArrayString`, `hashbrown::*` (so `indexmap` works). See `driver/src/config.rs`.
 
 Across *fast* awaits anything goes: borrows, sockets, tokio types.
 
@@ -125,6 +146,8 @@ Across *fast* awaits anything goes: borrows, sockets, tokio types.
 | A type without serde impls (`File`, tokio types) | "... does not implement Serialize + DeserializeOwned" | compile (lint) |
 | A value kept only for its destructor | same, plus "`drop` it or close its block before the await" | compile (lint) |
 | A value with a user `Drop` impl inside (`struct Lease` with `impl Drop`), not `DropOnPark` | "`x` has a destructor that would run when the task parks" | compile (lint) |
+| A handle type (`ProcessLocal`, or `process-local` in the config) anywhere inside a value | "... is a handle valid only in the process that created it" | compile (lint) |
+| A `trusted` config entry without both `drop` and `sharing` | "trusted `T` must state `sharing` ..." | compile |
 | A type private to its module | "... is private to its module ... make it `pub(crate)`" | compile (lint) |
 | `tokio::join!`, `tokio::select!`, `tokio::time::timeout` around a slow call | the `MaybeDone` / `Timeout` value cannot be serialized | compile (lint) |
 | An unstarted future held across a slow await (`Option<{async fn}>`) | "... holds an unnameable type" | compile (lint) |

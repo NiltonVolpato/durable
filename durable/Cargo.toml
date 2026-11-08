@@ -15,6 +15,10 @@ tokio = { version = "1.54.1", features = ["sync", "time"] }
 # `rc`: tests hold immutable `Arc`s across slow awaits.
 serde = { version = "1", features = ["derive", "rc"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+# Types trusted by durable-driver's defaults.
+bytes = { version = "1", features = ["serde"] }
+indexmap = { version = "2", features = ["serde"] }
+smallvec = { version = "1", features = ["serde"] }
 
 [lints.rust]
 # Set by durable-driver (cargo durable) on the crates it builds.

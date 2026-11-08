@@ -29,10 +29,15 @@ check lint_errors "\`lease\` has a destructor that would run when the task parks
 check lint_errors "\`job\` is live across the await; \`Lease\` implements \`Drop\`"
 check lint_errors "\`f.c0\` has a destructor"
 check lint_errors "\`later.upvar0\` has a destructor"
+check lint_errors "\`ls\` is live across the await; \`Lease\` implements \`Drop\`"
 # Identity
 check lint_errors "\`std::sync::Arc<std::sync::Mutex<u64>>\` is shared and mutable through \`std::sync::Mutex<u64>\`"
 check lint_errors "\`Shared\` holds \`std::rc::Rc<std::cell::RefCell<std::vec::Vec<std::string::String>>>\`, which is shared and mutable"
 check lint_errors "is shared and mutable through \`std::cell::Cell<u64>\`"
 check lint_errors "\`std::sync::Weak<u64>\` is a \`Weak\`; a stored one comes back empty"
+# Handle
+check lint_errors "\`SlotId\` is a handle valid only in the process that created it"
+check lint_errors "\`std::vec::Vec<ConnId>\` holds \`ConnId\`, which is a handle valid only"
+check lint_errors "\`slotmap::DefaultKey\` holds \`slotmap::KeyData\`, which is a handle valid only"
 echo "full output: $TD/durable/{macro_errors,lint_errors}.log"
 exit $fail

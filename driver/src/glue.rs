@@ -53,11 +53,6 @@ fn unsupported(ty: Ty<'_>) -> Option<String> {
     None
 }
 
-/// std, core and alloc: their destructors only free memory.
-pub fn is_std(tcx: TyCtxt<'_>, did: DefId) -> bool {
-    matches!(tcx.crate_name(did.krate).as_str(), "std" | "core" | "alloc")
-}
-
 pub enum Step {
     Found,
     Skip,
@@ -65,8 +60,8 @@ pub enum Step {
 }
 
 /// Walk the types a value of `ty` owns: tuple and array elements, the type
-/// arguments of std types, the fields of other ADTs (`PhantomData` owns
-/// nothing). Returns the first type `visit` reports as `Found`.
+/// arguments of std and trusted types (`Ctx::trusted`), the fields of other
+/// ADTs (`PhantomData` owns nothing). Returns the first type `visit` reports as `Found`.
 pub fn find_owned<'tcx>(cx: &Ctx<'tcx>, ty: Ty<'tcx>, visit: &mut impl FnMut(Ty<'tcx>) -> Step) -> Option<Ty<'tcx>> {
     fn go<'tcx>(
         cx: &Ctx<'tcx>,
@@ -84,7 +79,7 @@ pub fn find_owned<'tcx>(cx: &Ctx<'tcx>, ty: Ty<'tcx>, visit: &mut impl FnMut(Ty<
         }
         match ty.kind() {
             ty::Adt(def, _) if def.is_phantom_data() => None,
-            ty::Adt(def, args) if is_std(cx.tcx, def.did()) => args.types().find_map(|t| go(cx, t, visit, seen)),
+            ty::Adt(def, args) if cx.trusted(def.did()) => args.types().find_map(|t| go(cx, t, visit, seen)),
             ty::Adt(def, args) => {
                 def.all_fields().find_map(|f| go(cx, cx.normalize(f.ty(cx.tcx, *args)), visit, seen))
             }
@@ -225,10 +220,14 @@ impl<'a, 'tcx> Planner<'a, 'tcx> {
             _ => return Err(format!("`{ty}` does not implement Serialize + DeserializeOwned")),
         };
         // After serde: a type without serde impls gets that error instead.
-        match lost_identity(self.cx, ty) {
-            Some(why) => Err(why),
-            None => Ok(kind),
+        if let Some(why) = lost_identity(self.cx, ty) {
+            return Err(why);
         }
+        if let Some(h) = find_owned(self.cx, ty, &mut |t| if self.cx.process_local(t) { Step::Found } else { Step::Descend }) {
+            let what = if h == ty { format!("`{ty}`") } else { format!("`{ty}` holds `{h}`, which") };
+            return Err(format!("{what} is a handle valid only in the process that created it"));
+        }
+        Ok(kind)
     }
 
     /// Values stored in a coroutine state; None for the poisoned state.
